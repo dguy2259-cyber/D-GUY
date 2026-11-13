@@ -1,0 +1,64 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-ivory text-charcoal antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+    line-height: 1.5;
+  }
+
+  h1,
+  h2,
+  h3 {
+    line-height: 1.2;
+  }
+
+  :focus-visible {
+    outline: 2px solid #B86F5B;
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .clay-raised {
+    @apply bg-porcelain shadow-clay border border-white/70;
+  }
+
+  .clay-inset {
+    @apply bg-cream shadow-clay-inset border border-cream;
+  }
+
+  .clay-button {
+    @apply inline-flex items-center justify-center gap-2 rounded-2xl bg-terracotta-deep text-porcelain font-semibold shadow-clay-button transition duration-150 ease-out hover:-translate-y-px hover:bg-[#8A4D3C] active:translate-y-[3px] active:shadow-clay-button-pressed disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:translate-y-0 disabled:active:translate-y-0;
+  }
+
+  .clay-soft-button {
+    @apply inline-flex items-center justify-center gap-2 rounded-2xl bg-porcelain text-charcoal font-medium shadow-clay-soft-button border border-white/80 transition duration-150 ease-out hover:-translate-y-px hover:bg-white active:translate-y-[2px] disabled:cursor-not-allowed disabled:opacity-50;
+  }
+}
+
+@layer utilities {
+  .scrollbar-soft {
+    scrollbar-width: thin;
+    scrollbar-color: #E8B8A5 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}

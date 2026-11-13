@@ -1,0 +1,111 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String       @id
+  email        String       @unique
+  fullName     String?
+  passwordHash String?
+  role         String       @default("user")
+  createdAt    DateTime     @default(now())
+  sessions     Session[]
+  projects     Project[]
+  usage        Usage[]
+  audits       AuditEvent[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  csrfHash  String
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model Project {
+  id             String         @id @default(cuid())
+  ownerId        String
+  name           String
+  messages       Json           @default("[]")
+  activeVersionId String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  owner          User           @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  versions       Version[]
+  jobs           GenerationJob[]
+
+  @@index([ownerId, updatedAt])
+}
+
+model Version {
+  id        String   @id @default(cuid())
+  projectId String
+  number    Int
+  prompt    String
+  summary   String
+  templateId String
+  options   Json
+  files     Json
+  warnings  Json     @default("[]")
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, number])
+  @@index([projectId, createdAt])
+}
+
+model GenerationJob {
+  id          String   @id @default(cuid())
+  projectId   String
+  status      String   @default("queued")
+  prompt      String
+  requestKey  String?  @unique
+  contextFiles Json?
+  errorCode   String?
+  createdAt   DateTime @default(now())
+  finishedAt  DateTime?
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt])
+}
+
+model Usage {
+  id           String   @id @default(cuid())
+  userId       String
+  jobId        String
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model AuditEvent {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  resourceId String?
+  createdAt  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+}
+
+model ApiRateLimitBucket {
+  key     String   @id
+  hits    Int      @default(0)
+  resetAt DateTime
+
+  @@index([resetAt])
+}
