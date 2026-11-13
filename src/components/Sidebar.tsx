@@ -10,9 +10,10 @@ import {
   Plus,
   Settings,
   Sparkles,
+  ShieldAlert,
 } from 'lucide-react';
 
-export type NavKey = 'new' | 'builder' | 'projects' | 'files' | 'history' | 'settings';
+export type NavKey = 'new' | 'builder' | 'projects' | 'files' | 'history' | 'recovery' | 'settings';
 
 interface NavItem {
   key: NavKey;
@@ -26,6 +27,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'projects', label: 'Projects', icon: FolderKanban },
   { key: 'files', label: 'Generated Files', icon: FileCode2 },
   { key: 'history', label: 'Version History', icon: History },
+  { key: 'recovery', label: 'Autonomous Error Recovery', icon: ShieldAlert },
   { key: 'settings', label: 'Settings', icon: Settings },
 ];
 

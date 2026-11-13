@@ -13,11 +13,20 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { BackendAuthScreen } from '@/components/BackendAuthScreen';
 import { GitHubPullRequestDialog } from '@/components/GitHubPullRequestDialog';
 import { DeploymentPreparationDialog } from '@/components/DeploymentPreparationDialog';
+import { RecoveryDialog } from '@/components/RecoveryDialog';
 import { backendApi, type ApiUser } from '@/services/backendApi';
-import type { PreviewStatus, ViewportMode } from '@/types/project';
+import type { PreviewStatus, RuntimeErrorReport, ViewportMode } from '@/types/project';
+import type { RequirementOverrides } from '@/types/project';
 
-type Dialog = 'projects' | 'history' | 'settings';
+type Dialog = 'projects' | 'history' | 'recovery' | 'settings';
 type MobileTab = 'chat' | 'preview';
+interface RecoveryValidation { passed: boolean; message?: string; report?: RuntimeErrorReport }
+interface RecoveryWaiter {
+  versionId: string;
+  resolve: (result: RecoveryValidation) => void;
+  stableTimer?: number;
+  timeoutTimer?: number;
+}
 
 const DEFAULT_FILE = 'src/App.tsx';
 
@@ -29,17 +38,6 @@ function App() {
     return () => { active = false; };
   }, []);
   const workspace = useWorkspace(user?.id ?? null);
-  const attemptedRuntimeRepair = useRef(new Set<string>());
-  const runtimeRepairHandler = useRef<(message: string) => void>(() => undefined);
-  runtimeRepairHandler.current = (message) => {
-    const project = workspace.activeProject;
-    if (!project.id || !workspace.activeVersion || workspace.generation.status === 'running' || attemptedRuntimeRepair.current.has(project.id)) return;
-    attemptedRuntimeRepair.current.add(project.id);
-    const safeMessage = Array.from(message, (char) => char.charCodeAt(0) >= 32 && char.charCodeAt(0) !== 127 ? char : ' ').join('').slice(0, 600);
-    workspace.submitPrompt(`Fix the live preview runtime error in the current project. Error: ${safeMessage}. Inspect the existing files, correct the cause, and preserve unrelated behavior.`, { templateId: null, palette: null, testimonials: null });
-    setMobileTab('chat');
-  };
-  const handlePreviewRuntimeError = useCallback((message: string) => runtimeRepairHandler.current(message), []);
   const [viewport, setViewport] = useState<ViewportMode>('desktop');
   const [previewTab, setPreviewTab] = useState<PreviewTab>('preview');
   const [selectedPath, setSelectedPath] = useState(DEFAULT_FILE);
@@ -52,6 +50,44 @@ function App() {
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [githubDialog, setGithubDialog] = useState(false);
   const [deploymentDialog, setDeploymentDialog] = useState(false);
+  const [runningRecoverySessionId, setRunningRecoverySessionId] = useState<string | null>(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
+  const recoveryRunningRef = useRef(false);
+  const recoveryRunnerRef = useRef<(sessionId: string, manual: boolean, projectId: string) => Promise<void>>(async () => undefined);
+  const recoveryWaiterRef = useRef<RecoveryWaiter | null>(null);
+  const readyVersionsRef = useRef(new Set<string>());
+  const errorsByVersionRef = useRef(new Map<string, RuntimeErrorReport>());
+
+  const handlePreviewReady = useCallback((versionId: string) => {
+    readyVersionsRef.current.add(versionId);
+    while (readyVersionsRef.current.size > 50) readyVersionsRef.current.delete(readyVersionsRef.current.values().next().value!);
+    const waiter = recoveryWaiterRef.current;
+    if (!waiter || waiter.versionId !== versionId || waiter.stableTimer !== undefined) return;
+    waiter.stableTimer = window.setTimeout(() => waiter.resolve({ passed: true }), 4_000);
+  }, []);
+
+  const handlePreviewRuntimeError = useCallback((report: RuntimeErrorReport) => {
+    errorsByVersionRef.current.set(report.versionId, report);
+    while (errorsByVersionRef.current.size > 50) errorsByVersionRef.current.delete(errorsByVersionRef.current.keys().next().value!);
+    const waiter = recoveryWaiterRef.current;
+    if (waiter?.versionId === report.versionId) {
+      waiter.resolve({ passed: false, message: report.message, report });
+      return;
+    }
+    if (recoveryRunningRef.current) return;
+    const currentWorkspace = workspaceRef.current;
+    const projectId = currentWorkspace.activeProject.id;
+    if (!projectId || currentWorkspace.generation.status === 'running' || currentWorkspace.activeVersion?.id !== report.versionId) return;
+    void backendApi.reportRuntimeError(projectId, report).then((result) => {
+      if (result.ignored || !result.session) return;
+      if (result.autoEligible && result.autoRecoveryEnabled) void recoveryRunnerRef.current(result.session.id, false, projectId);
+      else setRecoveryNotice(result.session.status === 'awaiting_approval'
+        ? 'Runtime issue recorded for manual review; automatic repair was not started.'
+        : 'Runtime issue recorded. Review it in Autonomous Error Recovery or retry manually.');
+    }).catch((error: unknown) => setRecoveryNotice(error instanceof Error ? error.message : 'The runtime error could not be recorded.'));
+  }, []);
 
   if (user === undefined) return <div className="flex min-h-dvh items-center justify-center bg-ivory text-sm text-stone">Connecting to D-GUY…</div>;
   if (!user) return <BackendAuthScreen onAuthenticated={setUser} />;
@@ -60,6 +96,89 @@ function App() {
   const { activeProject, activeVersion, generation } = workspace;
   const running = generation.status === 'running';
 
+  const waitForPreviewValidation = (versionId: string) => new Promise<RecoveryValidation>((resolve) => {
+    let completed = false;
+    const finish = (result: RecoveryValidation) => {
+      if (completed) return;
+      completed = true;
+      if (recoveryWaiterRef.current?.versionId === versionId) {
+        if (recoveryWaiterRef.current.stableTimer !== undefined) window.clearTimeout(recoveryWaiterRef.current.stableTimer);
+        if (recoveryWaiterRef.current.timeoutTimer !== undefined) window.clearTimeout(recoveryWaiterRef.current.timeoutTimer);
+        recoveryWaiterRef.current = null;
+      }
+      resolve(result);
+    };
+    const waiter: RecoveryWaiter = { versionId, resolve: finish };
+    recoveryWaiterRef.current = waiter;
+    waiter.timeoutTimer = window.setTimeout(() => finish({ passed: false, message: 'The preview did not become ready within 30 seconds.' }), 30_000);
+    const priorError = errorsByVersionRef.current.get(versionId);
+    if (priorError) {
+      finish({ passed: false, message: priorError.message, report: priorError });
+      return;
+    }
+    if (readyVersionsRef.current.has(versionId)) waiter.stableTimer = window.setTimeout(() => finish({ passed: true }), 4_000);
+  });
+
+  const runRecoverySession = async (sessionId: string, manual: boolean, projectId: string) => {
+    if (recoveryRunningRef.current || workspaceRef.current.activeProject.id !== projectId) return;
+    recoveryRunningRef.current = true;
+    setRunningRecoverySessionId(sessionId);
+    setRecoveryNotice('Starting isolated recovery attempt…');
+    setPreviewTab('preview');
+    setMobileTab('preview');
+    try {
+      for (;;) {
+        const current = workspaceRef.current;
+        if (current.activeProject.id !== projectId) break;
+        const { attempt, prompt } = await backendApi.beginRecoveryAttempt(projectId, sessionId, manual);
+        if (workspaceRef.current.activeProject.id !== projectId) {
+          await backendApi.pauseRecovery(projectId, sessionId);
+          break;
+        }
+        setRecoveryNotice(`Recovery attempt ${attempt.attemptNumber}/5 is generating a targeted correction.`);
+        const requirements: RequirementOverrides = {
+          templateId: current.activeVersion?.templateId ?? 'saas',
+          palette: null,
+          testimonials: null,
+          menuBar: null,
+        };
+        const candidate = await workspaceRef.current.submitPrompt(prompt, requirements, attempt.id);
+        if (!candidate) {
+          setRecoveryNotice('AI generation did not produce a candidate. The existing saved version remains available.');
+          break;
+        }
+        setRecoveryNotice(`Attempt ${attempt.attemptNumber}/5 is restarting and validating the isolated preview.`);
+        const validation = await waitForPreviewValidation(candidate.id);
+        const result = await backendApi.validateRecoveryAttempt(projectId, sessionId, attempt.id, {
+          candidateVersionId: candidate.id,
+          passed: validation.passed,
+          ...(validation.report ? { error: validation.report } : validation.message ? { message: validation.message } : {}),
+        });
+        if (result.status === 'recovered') {
+          setRecoveryNotice(`Recovery verified for version ${candidate.number}.`);
+          break;
+        }
+        if (!validation.passed) await workspaceRef.current.reloadProject(projectId);
+        if (result.status === 'awaiting_approval') {
+          setRecoveryNotice('The latest preview failure requires manual review; no further AI attempt was started.');
+          break;
+        }
+        if (!result.retryAllowed) {
+          setRecoveryNotice('Automatic correction stopped at its safety limit. The last known-good version was restored.');
+          break;
+        }
+        setRecoveryNotice(`Attempt ${attempt.attemptNumber} did not pass validation. Restored the prior version; trying the next bounded attempt.`);
+      }
+    } catch (error) {
+      setRecoveryNotice(error instanceof Error ? error.message : 'Recovery stopped safely. Inspect the recovery history for details.');
+    } finally {
+      recoveryWaiterRef.current?.resolve({ passed: false, message: 'Recovery stopped before preview validation completed.' });
+      recoveryRunningRef.current = false;
+      setRunningRecoverySessionId(null);
+    }
+  };
+  recoveryRunnerRef.current = runRecoverySession;
+
   const previewStatus: PreviewStatus = running
     ? 'generating'
     : generation.status === 'error'
@@ -67,7 +186,13 @@ function App() {
       : activeVersion
         ? activeVersion.previewMode === 'static-files' ? 'ready' : 'preview-ready'
         : 'ready';
-  const saveLabel = running ? 'Generating…' : 'Saved to your account';
+  const saveLabel = running
+    ? 'Generating…'
+    : generation.saveState === 'retrying'
+      ? 'Preview ready · saving…'
+      : generation.saveState === 'failed'
+        ? 'Preview ready · not saved'
+        : 'Saved to your account';
   const activeNav: NavKey = dialog ?? (previewTab === 'files' ? 'files' : 'builder');
 
   const closeDialog = () => setDialog(null);
@@ -85,6 +210,7 @@ function App() {
         break;
       case 'projects':
       case 'history':
+      case 'recovery':
       case 'settings':
         setDialog(key);
         break;
@@ -170,8 +296,7 @@ function App() {
                 activeVersion={activeVersion}
                 generation={generation}
                 onSubmit={(prompt, requirements) => {
-                  attemptedRuntimeRepair.current.delete(activeProject.id);
-                  workspace.submitPrompt(prompt, requirements);
+                  void workspace.submitPrompt(prompt, requirements);
                 }}
               />
             </div>
@@ -191,6 +316,7 @@ function App() {
                 onOpenFullscreen={() => setFullscreen(true)}
                 onDownload={handleDownload}
                 onRuntimeError={handlePreviewRuntimeError}
+                onPreviewReady={handlePreviewReady}
                 onCreatePullRequest={() => setGithubDialog(true)}
                 onPrepareDeployment={() => setDeploymentDialog(true)}
               />
@@ -228,6 +354,21 @@ function App() {
           onClose={closeDialog}
         />
       )}
+      {dialog === 'recovery' && (
+        <RecoveryDialog
+          projectId={activeProject.id}
+          runningSessionId={runningRecoverySessionId}
+          onRetry={(sessionId) => runRecoverySession(sessionId, true, activeProject.id)}
+          onPause={(sessionId) => {
+            if (runningRecoverySessionId === sessionId) {
+              recoveryWaiterRef.current?.resolve({ passed: false, message: 'Recovery was paused by the user.' });
+              void workspace.reloadProject(activeProject.id).then(() => setRecoveryNotice('Recovery paused; the last known-good version is active.')).catch((error: unknown) => setRecoveryNotice(error instanceof Error ? error.message : 'Recovery paused, but the project view could not be refreshed.'));
+            }
+          }}
+          onRollback={() => workspace.reloadProject(activeProject.id).then(() => setRecoveryNotice('Restored the last known-good project version.'))}
+          onClose={closeDialog}
+        />
+      )}
       {dialog === 'settings' && (
         <SettingsDialog
           onLogout={() => { void backendApi.logout().catch(() => undefined).finally(() => setUser(null)); closeDialog(); }}
@@ -241,6 +382,7 @@ function App() {
       )}
       {githubDialog && <GitHubPullRequestDialog project={activeProject} onClose={() => setGithubDialog(false)} />}
       {deploymentDialog && <DeploymentPreparationDialog project={activeProject} onClose={() => setDeploymentDialog(false)} />}
+      {recoveryNotice && <div role="status" className="fixed bottom-5 left-5 z-40 flex max-w-md items-start gap-3 rounded-xl border border-cream bg-white/95 px-4 py-3 text-xs font-medium text-charcoal shadow-clay-lg"><span>{recoveryNotice}</span><button type="button" onClick={() => setRecoveryNotice(null)} className="shrink-0 font-semibold text-terracotta-deep">Dismiss</button></div>}
       {downloadError && <div role="alert" className="fixed bottom-5 right-5 z-50 max-w-sm rounded-2xl bg-red-50 p-4 text-sm text-red-900 shadow-clay-lg">{downloadError}</div>}
     </div>
   );

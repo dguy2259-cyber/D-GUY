@@ -17,7 +17,7 @@ const selectClass =
   'clay-inset w-full rounded-xl px-3 py-2 text-sm text-charcoal focus:outline-none focus:ring-2 focus:ring-terracotta/40';
 
 export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
 
   return (
     <div className="rounded-2xl px-1">
@@ -29,13 +29,13 @@ export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
       >
         <span className="flex items-center gap-2">
           <SlidersHorizontal size={14} />
-          Project requirements
+          Website options
         </span>
         <ChevronDown size={14} className={`transition ${open ? 'rotate-180' : ''}`} />
       </button>
 
       {open && (
-        <div className="mt-2 grid animate-fade-up gap-3 px-1 pb-1 sm:grid-cols-3">
+        <div className="mt-2 grid animate-fade-up gap-3 px-1 pb-1 sm:grid-cols-2 xl:grid-cols-4">
           <label className="grid gap-1.5 text-xs font-semibold text-stone">
             Website type
             <select
@@ -52,7 +52,7 @@ export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
             </select>
           </label>
           <label className="grid gap-1.5 text-xs font-semibold text-stone">
-            Color palette
+            Theme
             <select
               className={selectClass}
               value={value.palette ?? 'auto'}
@@ -64,6 +64,20 @@ export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
               {PALETTE_IDS.map((id) => (
                 <option key={id} value={id}>{palettes[id].name}</option>
               ))}
+            </select>
+          </label>
+          <label className="grid gap-1.5 text-xs font-semibold text-stone">
+            Top menu bar
+            <select
+              className={selectClass}
+              value={value.menuBar === null ? 'auto' : value.menuBar ? 'yes' : 'no'}
+              onChange={(event) =>
+                onChange({ ...value, menuBar: event.target.value === 'auto' ? null : event.target.value === 'yes' })
+              }
+            >
+              <option value="auto">Auto-detect</option>
+              <option value="yes">Include menu</option>
+              <option value="no">No menu bar</option>
             </select>
           </label>
           <label className="grid gap-1.5 text-xs font-semibold text-stone">

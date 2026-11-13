@@ -19,5 +19,6 @@ export function inferOptions(prompt: string): SiteOptions {
   const palette: PaletteId = /green|sage|forest|emerald|olive/.test(text) ? 'green'
     : /blue|navy|ocean|slate/.test(text) ? 'blue'
       : /charcoal|black|dark/.test(text) ? 'charcoal' : 'clay';
-  return { palette, testimonials: /testimonial|reviews?\b/.test(text), premiumHero: /premium|luxury|elegant/.test(text) };
+  const menuBar = !/\b(?:no|without|hide|remove|disable|omit)\s+(?:a\s+)?(?:top\s+)?(?:menu|navigation|nav)(?:\s+bar)?\b/.test(text);
+  return { palette, testimonials: /testimonial|reviews?\b/.test(text), premiumHero: /premium|luxury|elegant/.test(text), menuBar };
 }

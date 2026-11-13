@@ -1,10 +1,49 @@
 import { supabaseAuth } from './supabaseAuth';
 import { consumeGenerationStream } from './generationStream';
+import type { RuntimeErrorReport } from '@/types/project';
 
 export interface ApiUser { id: string; email: string; role?: string }
 export interface ApiProject { id: string; name: string; messages: Array<{ id: string; role: 'user' | 'assistant'; text: string }>; versions: ApiVersion[]; activeVersionId: string | null; createdAt: string; updatedAt: string }
 export interface ApiVersion { id: string; number: number; prompt?: string; summary: string; templateId: string; options: Record<string, unknown>; files?: Array<{ path: string; content: string }>; warnings?: string[]; createdAt: string }
-export interface ApiJob { id: string; status: string; progress: number | null; errorCode?: string }
+export interface ApiJob { id: string; status: string; progress: number | null; errorCode?: string; saveState?: 'retrying' | 'saved' | 'failed'; versionId?: string }
+export interface ApiRecoveryAttempt {
+  id: string;
+  attemptNumber: number;
+  status: string;
+  sourceVersionId: string;
+  candidateVersionId: string | null;
+  generationJobId: string | null;
+  failureReason: string | null;
+  validation: Record<string, unknown>;
+  startedAt: string;
+  completedAt: string | null;
+}
+export interface ApiRecoverySession {
+  id: string;
+  projectId: string;
+  sourceVersionId: string;
+  errorSignature: string;
+  environment: RuntimeErrorReport['environment'];
+  category: RuntimeErrorReport['category'];
+  message: string;
+  stackTrace: string | null;
+  sourceFile: string | null;
+  line: number | null;
+  column: number | null;
+  status: string;
+  attemptCount: number;
+  maxAttempts: number;
+  failureReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt: string | null;
+  attempts: ApiRecoveryAttempt[];
+}
+export interface ApiRecoveryDashboard {
+  autoRecoveryEnabled: boolean;
+  activeVersionId: string | null;
+  sessions: ApiRecoverySession[];
+}
 export interface GenerationStreamEvent { event: string; data: Record<string, unknown> }
 
 export class BackendApiError extends Error {
@@ -95,7 +134,7 @@ export const backendApi = {
   createProject: (name: string) => request<{ project: ApiProject }>('/projects', { method: 'POST', body: JSON.stringify({ name }) }),
   updateProject: (project: Pick<ApiProject, 'id' | 'name' | 'messages'>) => request<{ project: ApiProject }>(`/projects/${encodeURIComponent(project.id)}`, { method: 'PATCH', body: JSON.stringify({ name: project.name, messages: project.messages }) }),
   deleteProject: (id: string) => request<void>(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  startGeneration: (projectId: string, input: { prompt: string; templateId: string; options: object; mode: 'create' | 'revise'; idempotencyKey: string }, signal?: AbortSignal) => {
+  startGeneration: (projectId: string, input: { prompt: string; templateId: string; options: object; mode: 'create' | 'revise'; idempotencyKey: string; recoveryAttemptId?: string }, signal?: AbortSignal) => {
     const { idempotencyKey, ...body } = input;
     return request<{ job: ApiJob }>(`/projects/${encodeURIComponent(projectId)}/generations`, { method: 'POST', headers: { 'idempotency-key': idempotencyKey }, body: JSON.stringify(body), signal });
   },
@@ -109,6 +148,14 @@ export const backendApi = {
   },
   cancelGeneration: (id: string) => request<{ status: string }>(`/generations/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   project: async (id: string, signal?: AbortSignal) => (await request<{ project: ApiProject }>(`/projects/${encodeURIComponent(id)}`, { signal })).project,
+  recovery: (projectId: string) => request<ApiRecoveryDashboard>(`/projects/${encodeURIComponent(projectId)}/recovery`),
+  setAutoRecovery: (projectId: string, enabled: boolean) => request<{ autoRecoveryEnabled: boolean }>(`/projects/${encodeURIComponent(projectId)}/recovery-settings`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+  reportRuntimeError: (projectId: string, report: RuntimeErrorReport) => request<{ ignored?: boolean; reason?: string; session?: ApiRecoverySession; autoRecoveryEnabled?: boolean; autoEligible?: boolean; deduplicated?: boolean }>(`/projects/${encodeURIComponent(projectId)}/runtime-errors`, { method: 'POST', body: JSON.stringify(report) }),
+  beginRecoveryAttempt: (projectId: string, sessionId: string, manual = false) => request<{ attempt: ApiRecoveryAttempt; prompt: string }>(`/projects/${encodeURIComponent(projectId)}/recovery/${encodeURIComponent(sessionId)}/attempts`, { method: 'POST', body: JSON.stringify({ manual }) }),
+  validateRecoveryAttempt: (projectId: string, sessionId: string, attemptId: string, result: { candidateVersionId: string; passed: boolean; message?: string; error?: RuntimeErrorReport }) => request<{ status: string; retryAllowed: boolean; activeVersionId?: string }>(`/projects/${encodeURIComponent(projectId)}/recovery/${encodeURIComponent(sessionId)}/attempts/${encodeURIComponent(attemptId)}/validation`, { method: 'POST', body: JSON.stringify(result) }),
+  pauseRecovery: (projectId: string, sessionId: string) => request<{ status: string }>(`/projects/${encodeURIComponent(projectId)}/recovery/${encodeURIComponent(sessionId)}/pause`, { method: 'POST', body: '{}' }),
+  resumeRecovery: (projectId: string, sessionId: string) => request<{ status: string }>(`/projects/${encodeURIComponent(projectId)}/recovery/${encodeURIComponent(sessionId)}/resume`, { method: 'POST', body: '{}' }),
+  rollbackRecovery: (projectId: string, sessionId: string) => request<{ status: string; activeVersionId: string }>(`/projects/${encodeURIComponent(projectId)}/recovery/${encodeURIComponent(sessionId)}/rollback`, { method: 'POST', body: '{}' }),
   restore: (projectId: string, versionId: string) => request<{ version: ApiVersion }>(`/projects/${encodeURIComponent(projectId)}/versions/${encodeURIComponent(versionId)}/restore`, { method: 'POST' }),
   exportUrl: (id: string) => `${API_ROOT}/projects/${encodeURIComponent(id)}/export.zip`,
   createPullRequest: (projectId: string, input: { owner: string; repository: string; baseBranch?: string; title: string; body: string }) => request<{ pullRequest: { branch: string; commitSha: string; pullRequestUrl: string } }>(`/projects/${encodeURIComponent(projectId)}/github/pull-request`, { method: 'POST', body: JSON.stringify(input) }),

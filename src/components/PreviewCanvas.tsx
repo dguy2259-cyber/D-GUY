@@ -1,10 +1,12 @@
-import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { Blocks } from 'lucide-react';
 import { detectWebContainerProject } from '@/services/webcontainerFiles';
 import { localAssetDataUrl, rewriteLocalCssAssets } from '@/services/previewAssets';
-import type { ProjectFile, SiteVersion, ViewportMode } from '@/types/project';
+import type { ProjectFile, RuntimeErrorReport, SiteVersion, ViewportMode } from '@/types/project';
 
 const WebContainerPreview = lazy(() => import('@/components/WebContainerPreview').then((module) => ({ default: module.WebContainerPreview })));
+const ignoreRuntimeError = () => undefined;
+const ignorePreviewReady = () => undefined;
 
 const VIEWPORT_WIDTH: Record<ViewportMode, string> = {
   desktop: 'w-full',
@@ -17,19 +19,26 @@ interface PreviewCanvasProps {
   viewport: ViewportMode;
   refreshKey: number;
   buildingLabel: string | null;
-  onRuntimeError?: (message: string) => void;
+  onRuntimeError?: (report: RuntimeErrorReport) => void;
+  onPreviewReady?: (versionId: string) => void;
 }
 
-export function PreviewCanvas({ version, viewport, refreshKey, buildingLabel, onRuntimeError = () => undefined }: PreviewCanvasProps) {
+export function PreviewCanvas({ version, viewport, refreshKey, buildingLabel, onRuntimeError = ignoreRuntimeError, onPreviewReady = ignorePreviewReady }: PreviewCanvasProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [layoutAudit, setLayoutAudit] = useState<{ width: number; overflow: number } | null>(null);
+  const reportedErrors = useRef(new Set<string>());
+  const reportWebContainerError = useCallback((report: RuntimeErrorReport) => {
+    setRuntimeError(report.message.slice(0, 300));
+    onRuntimeError(report);
+  }, [onRuntimeError]);
   useEffect(() => {
     setRuntimeError(null);
     setLayoutAudit(null);
+    reportedErrors.current.clear();
     const onMessage = (event: MessageEvent<unknown>) => {
       if (event.source !== iframeRef.current?.contentWindow || !event.data || typeof event.data !== 'object') return;
-      const payload = event.data as { type?: unknown; message?: unknown };
+      const payload = event.data as { type?: unknown; category?: unknown; message?: unknown; stackTrace?: unknown; sourceFile?: unknown; line?: unknown; column?: unknown };
       if (payload.type === 'dguy:preview-layout' && 'width' in event.data && 'overflow' in event.data) {
         const layout = event.data as { width: unknown; overflow: unknown };
         if (Number.isFinite(layout.width) && Number.isFinite(layout.overflow)) {
@@ -37,10 +46,23 @@ export function PreviewCanvas({ version, viewport, refreshKey, buildingLabel, on
         }
         return;
       }
-      if (payload.type === 'dguy:preview-error' && typeof payload.message === 'string') {
-        const message = payload.message.slice(0, 600);
-        setRuntimeError(message.slice(0, 300));
-        onRuntimeError(message);
+      if (payload.type === 'dguy:preview-error' && typeof payload.message === 'string' && version?.id) {
+        const category = payload.category === 'unhandled_rejection' ? 'unhandled_rejection' : 'runtime';
+        const report: RuntimeErrorReport = {
+          versionId: version.id,
+          environment: 'sandbox_html',
+          category,
+          message: payload.message.slice(0, 2_000),
+          ...(typeof payload.stackTrace === 'string' ? { stackTrace: payload.stackTrace.slice(0, 6_000) } : {}),
+          ...(typeof payload.sourceFile === 'string' ? { sourceFile: payload.sourceFile.slice(0, 500) } : {}),
+          ...(typeof payload.line === 'number' && Number.isInteger(payload.line) && payload.line > 0 ? { line: payload.line } : {}),
+          ...(typeof payload.column === 'number' && Number.isInteger(payload.column) && payload.column > 0 ? { column: payload.column } : {}),
+        };
+        const key = `${report.category}:${report.sourceFile ?? ''}:${report.message}`;
+        if (reportedErrors.current.has(key)) return;
+        reportedErrors.current.add(key);
+        setRuntimeError(report.message.slice(0, 300));
+        onRuntimeError(report);
       }
     };
     window.addEventListener('message', onMessage);
@@ -53,10 +75,7 @@ export function PreviewCanvas({ version, viewport, refreshKey, buildingLabel, on
 
   if (version.files.some((file) => file.path === 'package.json')) {
     if (detectWebContainerProject(version.files)) {
-      return <Suspense fallback={<div role="status" className="flex h-full items-center justify-center text-sm text-stone">Loading browser runtime…</div>}><WebContainerPreview version={version} viewport={viewport} onRuntimeError={(message) => {
-        setRuntimeError(message.slice(0, 300));
-        onRuntimeError(message);
-      }} /></Suspense>;
+      return <Suspense fallback={<div role="status" className="flex h-full items-center justify-center text-sm text-stone">Loading browser runtime…</div>}><WebContainerPreview version={version} viewport={viewport} onRuntimeError={reportWebContainerError} onPreviewReady={onPreviewReady} /></Suspense>;
     }
     return <div role="status" className="flex h-full flex-col items-center justify-center bg-porcelain px-7 text-center">
       <div className="clay-raised max-w-md rounded-2xl p-6">
@@ -77,6 +96,7 @@ export function PreviewCanvas({ version, viewport, refreshKey, buildingLabel, on
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         srcDoc={createSandboxDocument(html, version.files)}
+        onLoad={() => onPreviewReady(version.id)}
         className={`h-full border-0 bg-white transition-[width] duration-500 ease-out ${VIEWPORT_WIDTH[viewport]}`}
       />
       {runtimeError && <div role="alert" className="absolute inset-x-3 top-3 max-w-xl rounded-xl border border-red-200 bg-red-50/95 p-3 text-sm text-red-900 shadow-lg">
@@ -162,10 +182,7 @@ function createSandboxDocument(html: string, files: ProjectFile[]) {
   source.querySelectorAll('style').forEach((style) => { style.textContent = rewriteLocalCssAssets(style.textContent ?? '', 'index.html', files); });
   source.querySelectorAll<HTMLElement>('[style]').forEach((element) => { element.setAttribute('style', rewriteLocalCssAssets(element.getAttribute('style') ?? '', 'index.html', files)); });
   const reporter = source.createElement('script');
-  // Resource load failures (for example, a remote font blocked by the sandbox CSP)
-  // are expected and arrive as plain Event objects with no message. Only report
-  // actual JavaScript ErrorEvents so they can trigger the self-correction flow.
-  reporter.textContent = `(()=>{const send=(value)=>{try{parent.postMessage({type:'dguy:preview-error',message:String(value).slice(0,300)},'*')}catch{}};addEventListener('error',event=>{if(event instanceof ErrorEvent&&event.message)send(event.message)},true);addEventListener('unhandledrejection',event=>{const reason=event.reason;if(reason instanceof Error)send(reason.message);else if(typeof reason==='string'&&reason)send(reason)},true)})()`;
+  reporter.textContent = `(()=>{const send=(category,message,detail)=>{try{parent.postMessage({type:'dguy:preview-error',category,message:String(message).slice(0,2000),stackTrace:String(detail?.stack||'').slice(0,6000),sourceFile:String(detail?.filename||'').slice(0,500),line:Number(detail?.lineno)||undefined,column:Number(detail?.colno)||undefined},'*')}catch{}};addEventListener('error',event=>{if(event instanceof ErrorEvent&&event.message)send('runtime',event.message,event)},true);addEventListener('unhandledrejection',event=>{const reason=event.reason;if(reason instanceof Error)send('unhandled_rejection',reason.message,reason);else if(typeof reason==='string'&&reason)send('unhandled_rejection',reason,{})},true)})()`;
   const layoutReporter = source.createElement('script');
   layoutReporter.textContent = `(()=>{let timer;const check=()=>{const width=document.documentElement.clientWidth||innerWidth;const clipped=element=>{for(let ancestor=element.parentElement;ancestor&&ancestor!==document.body;ancestor=ancestor.parentElement){const overflow=getComputedStyle(ancestor).overflowX;if(overflow==='hidden'||overflow==='clip')return true}return false};let maxRight=width;let minLeft=0;for(const element of document.querySelectorAll('body *')){const style=getComputedStyle(element);if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)continue;const rect=element.getBoundingClientRect();if(rect.width&&rect.height&&!clipped(element)){if(rect.right>width+1)maxRight=Math.max(maxRight,rect.right);if(rect.left< -1)minLeft=Math.min(minLeft,rect.left)}}const overflow=Math.max(0,Math.ceil(maxRight-width),Math.ceil(-minLeft));try{parent.postMessage({type:'dguy:preview-layout',width,overflow},'*')}catch{}};addEventListener('load',()=>setTimeout(check,650));addEventListener('resize',()=>{clearTimeout(timer);timer=setTimeout(check,650)});setTimeout(check,650)})()`;
   const csp = source.createElement('meta');

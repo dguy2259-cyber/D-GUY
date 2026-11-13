@@ -17,12 +17,15 @@ import { createDatabasePool, databaseConnectionDiagnostics, databaseFailureCateg
 import { z } from 'zod';
 import { createSafeZip, projectFilesSchema } from './security/files.js';
 import { requestValidationFields, requestValidationMessage } from './security/requestValidation.js';
-import { generateVanillaWebsiteWithFallback, GenerationFailure, validateVanillaProject } from './ai/provider.js';
+import { generateVanillaWebsiteWithFallback, GenerationFailure, validateVanillaProject, verifyGeminiModel, verifyGroqModels } from './ai/provider.js';
 import type { GeminiDiagnosticEvent, GenerationEvent } from './ai/provider.js';
-import { persistGeneratedVersion } from './generation/persistence.js';
+import { persistGeneratedVersion, ProjectVersionConflictError } from './generation/persistence.js';
+import { persistOrKeepPreview } from './generation/previewSave.js';
+import { composeWebsitePrompt } from './generation/prompt.js';
 import { GenerationEventHistory } from './generation/eventHistory.js';
 import { generationFailureForClient, storedGenerationFailure } from './generation/failure.js';
 import { failInterruptedGenerations } from './generation/recovery.js';
+import { classifyRuntimeError, containsCredentialLikeValue, createRecoveryPrompt, MAX_RECOVERY_ATTEMPTS, normalizeRuntimeError, redactRuntimeText, recoveryRetryPolicy, runtimeErrorReportSchema, validateRecoveryPatch } from './recovery/runtimeError.js';
 import { isUsableSignupIdentity, registrationProfileData, registrationSchema, registrationValidationMessage, signupConfirmationUrl, SIGNUP_CONFIRMATION_MESSAGE, signupFailure, type SupabaseSignupUser } from './auth/registration.js';
 import { resendSignupCodeSchema, SIGNUP_CODE_SENT_MESSAGE, verificationFailure, verifySignupCodeSchema } from './auth/emailVerification.js';
 import { decideGoogleProfile, googleClientProfileData } from './auth/googleOAuth.js';
@@ -56,28 +59,73 @@ for (const [label, value] of [['GROQ_BASE_URL', groqBaseUrl], ['GEMINI_BASE_URL'
   const url = new URL(value);
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw new Error(`${label} must be an HTTPS URL without credentials, query, or fragment`);
 }
-if (!process.env.GROQ_API_KEY || !process.env.GEMINI_API_KEY) throw new Error('GROQ_API_KEY and GEMINI_API_KEY are required for real generation and fallback');
-const aiTimeoutMs = z.coerce.number().int().min(1_000).max(120_000).default(90_000).parse(process.env.AI_TIMEOUT_MS);
-const providerTimeout = (name: string, fallback: number) => z.coerce.number().int().min(1_000).max(120_000).default(Math.min(aiTimeoutMs, fallback)).parse(process.env[name]);
-const geminiTimeoutMs = providerTimeout('GEMINI_TIMEOUT_MS', 55_000);
-const groqTimeoutMs = providerTimeout('GROQ_TIMEOUT_MS', 25_000);
-const openRouterTimeoutMs = providerTimeout('OPENROUTER_TIMEOUT_MS', 45_000);
-const huggingFaceTimeoutMs = providerTimeout('HF_TIMEOUT_MS', 10_000);
-const generationTotalTimeoutMs = z.coerce.number().int().min(30_000).max(120_000).default(110_000).parse(process.env.AI_GENERATION_TOTAL_TIMEOUT_MS);
+if (![process.env.GROQ_API_KEY, process.env.GEMINI_API_KEY, process.env.OPENROUTER_API_KEY].some(Boolean)) {
+  throw new Error('Configure at least one of GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY for real generation');
+}
+const firstByteTimeoutMs = z.coerce.number().int().min(1_000).max(120_000).default(30_000).parse(process.env.FIRST_BYTE_TIMEOUT_MS);
+const streamIdleTimeoutMs = z.coerce.number().int().min(1_000).max(120_000).default(30_000).parse(process.env.STREAM_IDLE_TIMEOUT_MS);
+const configuredTotalDeadlineMs = z.coerce.number().int().min(1_000).max(120_000).default(60_000).parse(process.env.TOTAL_DEADLINE_MS);
+const totalDeadlineMs = Math.min(configuredTotalDeadlineMs, 60_000);
+if (configuredTotalDeadlineMs > totalDeadlineMs) {
+  logger.warn({ configuredTotalDeadlineMs, totalDeadlineMs }, 'per-provider total deadline is capped at 60000ms');
+}
+const huggingFaceTimeoutMs = z.coerce.number().int().min(1_000).max(120_000).default(10_000).parse(process.env.HF_TIMEOUT_MS);
+const configuredGenerationTotalTimeoutMs = z.coerce.number().int().min(30_000).max(360_000).default(120_000).parse(process.env.AI_GENERATION_TOTAL_TIMEOUT_MS);
+const generationTotalTimeoutMs = Math.min(configuredGenerationTotalTimeoutMs, 120_000);
+if (configuredGenerationTotalTimeoutMs > generationTotalTimeoutMs) {
+  logger.warn({ configuredGenerationTotalTimeoutMs, generationTotalTimeoutMs }, 'website generation deadline is capped at 120000ms');
+}
 const supabaseAuthTimeoutMs = z.coerce.number().int().min(1_000).max(30_000).default(12_000).parse(process.env.SUPABASE_AUTH_TIMEOUT_MS);
+const providerOrder = z.array(z.enum(['groq', 'gemini', 'openrouter'])).min(1)
+  .refine((providers) => new Set(providers).size === providers.length, 'PROVIDER_ORDER must not contain duplicates')
+  .parse((process.env.PROVIDER_ORDER ?? 'groq,gemini,openrouter').split(',').map((provider) => provider.trim()).filter(Boolean));
+const singleRequestMode = z.enum(['true', 'false']).default('true')
+  .parse((process.env.SINGLE_REQUEST_MODE ?? 'true').toLowerCase()) === 'true';
 const aiModels = {
   reasoning: process.env.AI_MODEL || 'openai/gpt-oss-120b',
   coding: process.env.AI_CODER_MODEL || 'qwen/qwen3.8-27b',
-  fallback: process.env.AI_FALLBACK_MODEL || 'gemini-3.8-flash',
+  fallback: process.env.GEMINI_MODEL || process.env.AI_FALLBACK_MODEL || 'gemini-2.5-flash',
 };
+if (!process.env.GROQ_API_KEY) logger.warn({ provider: 'groq', reason: 'missing_api_key' }, 'AI provider skipped at startup');
+if (!process.env.GEMINI_API_KEY) logger.warn({ provider: 'gemini', reason: 'missing_api_key' }, 'AI provider skipped at startup');
+if (!process.env.OPENROUTER_API_KEY) logger.warn({ provider: 'openrouter', reason: 'missing_api_key' }, 'AI provider skipped at startup');
+if (process.env.GEMINI_API_KEY) {
+  const configuredModel = aiModels.fallback;
+  const verification = await verifyGeminiModel(geminiBaseUrl, process.env.GEMINI_API_KEY, configuredModel);
+  aiModels.fallback = verification.model;
+  if (verification.fallbackUsed) {
+    logger.warn({ configuredModel, selectedModel: verification.model, reason: verification.reason }, 'configured Gemini model is unavailable; using the known-good fallback');
+  } else if (!verification.verified) {
+    logger.warn({ model: configuredModel, reason: verification.reason }, 'Gemini model list could not be verified; retaining the configured model');
+  } else {
+    logger.info({ model: verification.model }, 'Gemini model verified');
+  }
+}
+const groqModelsToVerify = process.env.GROQ_MODEL
+  ? [process.env.GROQ_MODEL]
+  : [...new Set([aiModels.coding, aiModels.reasoning])];
+if (process.env.GROQ_API_KEY) {
+  const verification = await verifyGroqModels(groqBaseUrl, process.env.GROQ_API_KEY, groqModelsToVerify);
+  if (!verification.verified) {
+    logger.warn({
+      models: groqModelsToVerify,
+      missingModels: verification.missingModels,
+      reason: verification.reason,
+    }, 'Groq model verification failed; provider fallback will remain available');
+  } else {
+    logger.info({ models: groqModelsToVerify }, 'Groq models verified');
+  }
+}
 const openRouterConfig = process.env.OPENROUTER_API_KEY ? {
   baseUrl: openRouterBaseUrl,
   apiKey: process.env.OPENROUTER_API_KEY,
   model: process.env.OPENROUTER_MODEL || '',
-  timeoutMs: openRouterTimeoutMs,
+  firstByteTimeoutMs,
+  streamIdleTimeoutMs,
+  totalDeadlineMs,
 } : undefined;
 if (openRouterConfig && !openRouterConfig.model) throw new Error('OPENROUTER_MODEL is required when OPENROUTER_API_KEY is configured');
-logger.info({ gemini: aiModels.fallback, groqConfigured: !!process.env.GROQ_API_KEY, openRouterConfigured: !!openRouterConfig }, 'website generation provider routing configured');
+logger.info({ providerOrder, singleRequestMode, gemini: aiModels.fallback, groqConfigured: !!process.env.GROQ_API_KEY, openRouterConfigured: !!openRouterConfig, firstByteTimeoutMs, streamIdleTimeoutMs, totalDeadlineMs }, 'website generation provider routing configured');
 const huggingFaceToken = process.env.HF_TOKEN || '';
 const huggingFaceModel = process.env.HF_MODEL || 'Qwen/Qwen2.5-Coder-32B-Instruct';
 const huggingFaceProvider = process.env.HF_PROVIDER || 'featherless-ai';
@@ -126,6 +174,11 @@ class SupabaseUnavailableError extends Error { constructor() { super('Supabase A
 const activeControllers = new Map<string, AbortController>();
 const generationClients = new Map<string, Set<express.Response>>();
 const generationEventHistory = new GenerationEventHistory();
+type GenerationSaveStatus = { state: 'retrying' | 'saved' | 'failed'; versionId?: string; updatedAt: number };
+type PendingVersionSave = { input: Parameters<typeof persistGeneratedVersion>[1]; attempts: number; timer?: ReturnType<typeof setTimeout> };
+const generationSaveStates = new Map<string, GenerationSaveStatus>();
+const pendingVersionSaves = new Map<string, PendingVersionSave>();
+let shutdownStarted = false;
 const attemptBuckets = new Map<string, { count: number; resetAt: number }>();
 let lastRateLimitSweep = 0;
 const distributedRateLimits = process.env.NODE_ENV === 'production';
@@ -176,6 +229,50 @@ function publishGeneration(jobId: string, event: string, data: unknown) {
     if (['complete', 'failed', 'cancelled'].includes(event)) client.end();
   }
   if (!clients.size) generationClients.delete(jobId);
+}
+function setGenerationSaveState(jobId: string, state: Omit<GenerationSaveStatus, 'updatedAt'>) {
+  generationSaveStates.set(jobId, { ...state, updatedAt: Date.now() });
+  if (generationSaveStates.size > 500) {
+    const oldest = [...generationSaveStates.entries()].sort((left, right) => left[1].updatedAt - right[1].updatedAt)[0]?.[0];
+    if (oldest) generationSaveStates.delete(oldest);
+  }
+}
+function scheduleVersionPersistenceRetry(jobId: string, input: Parameters<typeof persistGeneratedVersion>[1]) {
+  if (shutdownStarted) {
+    setGenerationSaveState(jobId, { state: 'failed' });
+    return;
+  }
+  if (!pendingVersionSaves.has(jobId) && pendingVersionSaves.size >= 100) {
+    setGenerationSaveState(jobId, { state: 'failed' });
+    logger.error({ jobId }, 'generated preview is ready, but background save capacity is full');
+    return;
+  }
+  const pending = pendingVersionSaves.get(jobId) ?? { input, attempts: 0 };
+  pendingVersionSaves.set(jobId, pending);
+  setGenerationSaveState(jobId, { state: 'retrying' });
+  const retry = async () => {
+    pending.attempts += 1;
+    try {
+      const version = await persistGeneratedVersion(prisma, pending.input);
+      pendingVersionSaves.delete(jobId);
+      setGenerationSaveState(jobId, { state: 'saved', versionId: version.id });
+      publishGeneration(jobId, 'saved', { versionId: version.id });
+      logger.info({ jobId, attempt: pending.attempts }, 'background project-version save succeeded');
+    } catch (error) {
+      if (shutdownStarted || pending.attempts >= 8) {
+        pendingVersionSaves.delete(jobId);
+        setGenerationSaveState(jobId, { state: 'failed' });
+        logger.error({ jobId, attempts: pending.attempts, category: databaseFailureCategory(error), errorName: error instanceof Error ? error.name : 'UnknownError' }, 'background project-version save retries exhausted; preview remains available in the active browser session');
+        return;
+      }
+      const delayMs = Math.min(60_000, 1_000 * 2 ** (pending.attempts - 1));
+      logger.warn({ jobId, attempt: pending.attempts, retryInMs: delayMs, category: databaseFailureCategory(error), errorName: error instanceof Error ? error.name : 'UnknownError' }, 'background project-version save failed; retry scheduled');
+      pending.timer = setTimeout(() => { void retry(); }, delayMs);
+      pending.timer.unref();
+    }
+  };
+  pending.timer = setTimeout(() => { void retry(); }, 1_000);
+  pending.timer.unref();
 }
 async function auth(req: express.Request, res: express.Response, next: express.NextFunction) {
   try {
@@ -271,7 +368,74 @@ function issueAuthCookies(res: express.Response, session: SupabaseSession, issue
   }
 }
 function clearAuthCookies(res: express.Response) { for (const name of [accessCookie, refreshCookie, csrfCookie]) res.clearCookie(name, sessionCookieOptions(secure, name !== csrfCookie)); }
-const ownerProject = async (id: string, ownerId: string) => prisma.project.findFirst({ where: { id, ownerId }, include: { versions: { orderBy: { number: 'desc' }, take: 1 } } });
+const projectSelect = {
+  id: true,
+  ownerId: true,
+  name: true,
+  messages: true,
+  activeVersionId: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Prisma.ProjectSelect;
+const ownerProject = async (id: string, ownerId: string) => prisma.project.findFirst({
+  where: { id, ownerId },
+  select: {
+    ...projectSelect,
+    versions: { orderBy: { number: 'desc' }, take: 1 },
+  },
+});
+const recoverySchemaCacheMs = 30_000;
+let recoverySchemaState: { available: boolean; checkedAt: number } | undefined;
+async function hasRuntimeRecoverySchema() {
+  const now = Date.now();
+  if (recoverySchemaState && now - recoverySchemaState.checkedAt < recoverySchemaCacheMs) return recoverySchemaState.available;
+  const result = await databasePool.query<{
+    projectColumn: boolean;
+    sessionTable: boolean;
+    attemptTable: boolean;
+  }>(`
+    SELECT
+      EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'Project'
+          AND column_name = 'autoRecoveryEnabled'
+      ) AS "projectColumn",
+      EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name = 'RuntimeRecoverySession'
+      ) AS "sessionTable",
+      EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name = 'RuntimeRecoveryAttempt'
+      ) AS "attemptTable"
+  `);
+  const schema = result.rows[0];
+  if (!schema) throw new Error('Recovery schema readiness query returned no result.');
+  recoverySchemaState = { available: schema.projectColumn && schema.sessionTable && schema.attemptTable, checkedAt: now };
+  return recoverySchemaState.available;
+}
+async function requireRuntimeRecoverySchema(_req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    if (!await hasRuntimeRecoverySchema()) return fail(res, 503, 'SCHEMA_NOT_READY', 'A required database migration has not been applied.');
+    next();
+  } catch (error) { next(error); }
+}
+const ownerRecoverySession = (projectId: string, sessionId: string, ownerId: string) => prisma.runtimeRecoverySession.findFirst({
+  where: { id: sessionId, projectId, project: { ownerId } },
+  include: {
+    project: { select: { autoRecoveryEnabled: true } },
+    attempts: { orderBy: { attemptNumber: 'desc' }, take: MAX_RECOVERY_ATTEMPTS },
+  },
+});
+class RecoveryNeedsApprovalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RecoveryNeedsApprovalError';
+  }
+}
 const emailSchema = z.string().email().max(254).transform((v) => v.toLowerCase());
 const writeAudit = (userId: string, action: string, resourceId?: string) => prisma.auditEvent.create({ data: { userId, action, resourceId } }).catch((error) => logger.error({ code: (error as any)?.code, action }, 'audit event could not be stored'));
 
@@ -504,23 +668,357 @@ app.post('/api/v1/auth/password', rateLimit(5, 15 * 60_000), async (req, res, ne
     res.status(204).end();
   } catch (error) { next(error); }
 });
-app.get('/api/v1/projects', auth, async (req, res, next) => { try { const page = z.coerce.number().int().min(1).max(10000).default(1).parse(req.query.page); const limit = z.coerce.number().int().min(1).max(20).default(20).parse(req.query.limit); const ownerId = (req as any).user.id; res.json({ projects: await prisma.project.findMany({ where: { ownerId }, orderBy: { updatedAt: 'desc' }, skip: (page - 1) * limit, take: limit, include: { versions: { orderBy: { number: 'desc' }, take: 100, select: { id: true, number: true, prompt: true, summary: true, templateId: true, options: true, warnings: true, createdAt: true } } } }) }); } catch (e) { next(e); } });
-app.post('/api/v1/projects', auth, async (req, res, next) => { try { const body = z.object({ name: z.string().trim().min(1).max(120) }).strict().parse(req.body); const ownerId = (req as any).user.id; if (await prisma.project.count({ where: { ownerId } }) >= 20) return fail(res, 429, 'PROJECT_LIMIT', 'Project limit reached'); const p = await prisma.project.create({ data: { ownerId, name: body.name } }); res.status(201).json({ project: { ...p, versions: [] } }); } catch (e) { next(e); } });
+app.get('/api/v1/projects', auth, async (req, res, next) => { try { const page = z.coerce.number().int().min(1).max(10000).default(1).parse(req.query.page); const limit = z.coerce.number().int().min(1).max(20).default(20).parse(req.query.limit); const ownerId = (req as any).user.id; res.json({ projects: await prisma.project.findMany({ where: { ownerId }, orderBy: { updatedAt: 'desc' }, skip: (page - 1) * limit, take: limit, select: { ...projectSelect, versions: { orderBy: { number: 'desc' }, take: 100, select: { id: true, number: true, prompt: true, summary: true, templateId: true, options: true, warnings: true, createdAt: true } } } }) }); } catch (e) { next(e); } });
+app.post('/api/v1/projects', auth, async (req, res, next) => { try { const body = z.object({ name: z.string().trim().min(1).max(120) }).strict().parse(req.body); const ownerId = (req as any).user.id; if (await prisma.project.count({ where: { ownerId } }) >= 20) return fail(res, 429, 'PROJECT_LIMIT', 'Project limit reached'); const p = await prisma.project.create({ data: { ownerId, name: body.name }, select: projectSelect }); res.status(201).json({ project: { ...p, versions: [] } }); } catch (e) { next(e); } });
 app.get('/api/v1/projects/:id', auth, async (req, res) => {
   const id = z.string().min(1).max(64).parse(req.params.id); const ownerId = (req as any).user.id as string;
-  const project = await prisma.project.findFirst({ where: { id, ownerId } });
+  const project = await prisma.project.findFirst({ where: { id, ownerId }, select: projectSelect });
   if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found');
   const versions = await prisma.version.findMany({ where: { projectId: id }, orderBy: { number: 'desc' }, take: 100, select: { id: true, projectId: true, number: true, prompt: true, summary: true, templateId: true, options: true, warnings: true, createdAt: true } });
   const activeFiles = project.activeVersionId ? (await prisma.version.findFirst({ where: { id: project.activeVersionId, projectId: id }, select: { files: true } }))?.files : undefined;
   res.json({ project: { ...project, versions: versions.map((version) => ({ ...version, files: version.id === project.activeVersionId ? activeFiles ?? [] : [] })) } });
 });
-app.patch('/api/v1/projects/:id', auth, async (req, res, next) => { try { const body = z.object({ name: z.string().trim().min(1).max(120), messages: z.array(z.object({ id: z.string().max(100), role: z.enum(['user', 'assistant']), text: z.string().max(10000) })).max(200).optional() }).strict().parse(req.body); const found = await ownerProject(z.string().min(1).max(64).parse(req.params.id), (req as any).user.id); if (!found) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const p = await prisma.project.update({ where: { id: found.id }, data: body }); res.json({ project: p }); } catch (e) { next(e); } });
-app.delete('/api/v1/projects/:id', auth, async (req, res) => { const found = await prisma.project.findFirst({ where: { id: z.string().min(1).max(64).parse(req.params.id), ownerId: (req as any).user.id } }); if (!found) return fail(res, 404, 'NOT_FOUND', 'Project not found'); await prisma.project.delete({ where: { id: found.id } }); await writeAudit((req as any).user.id, 'project.deleted', found.id); res.status(204).end(); });
+app.patch('/api/v1/projects/:id', auth, async (req, res, next) => { try { const body = z.object({ name: z.string().trim().min(1).max(120), messages: z.array(z.object({ id: z.string().max(100), role: z.enum(['user', 'assistant']), text: z.string().max(10000) })).max(200).optional() }).strict().parse(req.body); const found = await ownerProject(z.string().min(1).max(64).parse(req.params.id), (req as any).user.id); if (!found) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const p = await prisma.project.update({ where: { id: found.id }, data: body, select: projectSelect }); res.json({ project: p }); } catch (e) { next(e); } });
+app.delete('/api/v1/projects/:id', auth, async (req, res) => { const found = await prisma.project.findFirst({ where: { id: z.string().min(1).max(64).parse(req.params.id), ownerId: (req as any).user.id, }, select: { id: true } }); if (!found) return fail(res, 404, 'NOT_FOUND', 'Project not found'); await prisma.project.delete({ where: { id: found.id }, select: { id: true } }); await writeAudit((req as any).user.id, 'project.deleted', found.id); res.status(204).end(); });
 app.get('/api/v1/projects/:id/files', auth, async (req, res) => { const p = await ownerProject(z.string().min(1).max(64).parse(req.params.id), (req as any).user.id); if (!p) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const v = p.versions.find((item) => item.id === p.activeVersionId) ?? p.versions.at(-1); res.json({ files: v?.files ?? [] }); });
-app.put('/api/v1/projects/:id/files', auth, async (req, res, next) => { try { const files = projectFilesSchema.parse(req.body.files); const p = await ownerProject(z.string().min(1).max(64).parse(req.params.id), (req as any).user.id); if (!p) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const number = p.versions[0]?.number ?? 0; if (number >= 100) return fail(res, 409, 'VERSION_LIMIT', 'Version limit reached; start a new project to continue'); const version = await prisma.version.create({ data: { projectId: p.id, number: number + 1, prompt: 'Manual file update', summary: 'Files updated', templateId: 'custom', options: {}, files } }); await prisma.project.update({ where: { id: p.id }, data: { activeVersionId: version.id } }); res.status(201).json({ version }); } catch (e) { next(e); } });
-app.get('/api/v1/projects/:id/versions', auth, async (req, res, next) => { try { const id = z.string().min(1).max(64).parse(req.params.id); const page = z.coerce.number().int().min(1).max(10000).default(1).parse(req.query.page); const limit = z.coerce.number().int().min(1).max(100).default(50).parse(req.query.limit); const project = await prisma.project.findFirst({ where: { id, ownerId: (req as any).user.id } }); if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const versions = await prisma.version.findMany({ where: { projectId: id }, orderBy: { number: 'desc' }, skip: (page - 1) * limit, take: limit, select: { id: true, projectId: true, number: true, prompt: true, summary: true, templateId: true, options: true, warnings: true, createdAt: true } }); res.json({ versions: versions.map((version) => ({ ...version, files: [] })) }); } catch (error) { next(error); } });
+app.put('/api/v1/projects/:id/files', auth, async (req, res, next) => { try { const files = projectFilesSchema.parse(req.body.files); const p = await ownerProject(z.string().min(1).max(64).parse(req.params.id), (req as any).user.id); if (!p) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const number = p.versions[0]?.number ?? 0; if (number >= 100) return fail(res, 409, 'VERSION_LIMIT', 'Version limit reached; start a new project to continue'); const version = await prisma.version.create({ data: { projectId: p.id, number: number + 1, prompt: 'Manual file update', summary: 'Files updated', templateId: 'custom', options: {}, files } }); await prisma.project.update({ where: { id: p.id }, data: { activeVersionId: version.id }, select: { id: true } }); res.status(201).json({ version }); } catch (e) { next(e); } });
+app.get('/api/v1/projects/:id/versions', auth, async (req, res, next) => { try { const id = z.string().min(1).max(64).parse(req.params.id); const page = z.coerce.number().int().min(1).max(10000).default(1).parse(req.query.page); const limit = z.coerce.number().int().min(1).max(100).default(50).parse(req.query.limit); const project = await prisma.project.findFirst({ where: { id, ownerId: (req as any).user.id }, select: { id: true } }); if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const versions = await prisma.version.findMany({ where: { projectId: id }, orderBy: { number: 'desc' }, skip: (page - 1) * limit, take: limit, select: { id: true, projectId: true, number: true, prompt: true, summary: true, templateId: true, options: true, warnings: true, createdAt: true } }); res.json({ versions: versions.map((version) => ({ ...version, files: [] })) }); } catch (error) { next(error); } });
 app.get('/api/v1/projects/:id/versions/:versionId', auth, async (req, res) => { const id = z.string().min(1).max(64).parse(req.params.id); const versionId = z.string().min(1).max(64).parse(req.params.versionId); const project = await prisma.project.findFirst({ where: { id, ownerId: (req as any).user.id }, select: { id: true } }); if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const version = await prisma.version.findFirst({ where: { id: versionId, projectId: project.id } }); if (!version) return fail(res, 404, 'NOT_FOUND', 'Version not found'); res.json({ version }); });
-app.post('/api/v1/projects/:id/versions/:versionId/restore', auth, async (req, res) => { const id = z.string().min(1).max(64).parse(req.params.id); const versionId = z.string().min(1).max(64).parse(req.params.versionId); const project = await prisma.project.findFirst({ where: { id, ownerId: (req as any).user.id } }); if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const source = await prisma.version.findFirst({ where: { id: versionId, projectId: project.id } }); if (!source) return fail(res, 404, 'NOT_FOUND', 'Version not found'); const latest = await prisma.version.findFirst({ where: { projectId: id }, orderBy: { number: 'desc' }, select: { number: true } }); if ((latest?.number ?? 0) >= 100) return fail(res, 409, 'VERSION_LIMIT', 'Version limit reached; start a new project to continue'); const restored = await prisma.version.create({ data: { projectId: project.id, number: (latest?.number ?? 0) + 1, prompt: `Restore version ${source.number}`, summary: `Restored from version ${source.number}`, templateId: source.templateId, options: source.options as Prisma.InputJsonObject, files: source.files as Prisma.InputJsonValue, warnings: source.warnings as Prisma.InputJsonValue } }); await prisma.project.update({ where: { id: project.id }, data: { activeVersionId: restored.id } }); res.status(201).json({ version: restored }); });
+app.post('/api/v1/projects/:id/versions/:versionId/restore', auth, async (req, res) => { const id = z.string().min(1).max(64).parse(req.params.id); const versionId = z.string().min(1).max(64).parse(req.params.versionId); const project = await prisma.project.findFirst({ where: { id, ownerId: (req as any).user.id }, select: { id: true } }); if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found'); const source = await prisma.version.findFirst({ where: { id: versionId, projectId: project.id } }); if (!source) return fail(res, 404, 'NOT_FOUND', 'Version not found'); const latest = await prisma.version.findFirst({ where: { projectId: id }, orderBy: { number: 'desc' }, select: { number: true } }); if ((latest?.number ?? 0) >= 100) return fail(res, 409, 'VERSION_LIMIT', 'Version limit reached; start a new project to continue'); const restored = await prisma.version.create({ data: { projectId: project.id, number: (latest?.number ?? 0) + 1, prompt: `Restore version ${source.number}`, summary: `Restored from version ${source.number}`, templateId: source.templateId, options: source.options as Prisma.InputJsonObject, files: source.files as Prisma.InputJsonValue, warnings: source.warnings as Prisma.InputJsonValue } }); await prisma.project.update({ where: { id: project.id }, data: { activeVersionId: restored.id }, select: { id: true } }); res.status(201).json({ version: restored }); });
+
+app.get('/api/v1/projects/:id/recovery', auth, requireRuntimeRecoverySchema, async (req, res) => {
+  const projectId = z.string().min(1).max(64).parse(req.params.id);
+  const project = await prisma.project.findFirst({
+    where: { id: projectId, ownerId: (req as any).user.id },
+    select: { autoRecoveryEnabled: true, activeVersionId: true },
+  });
+  if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found');
+  const sessions = await prisma.runtimeRecoverySession.findMany({
+    where: { projectId },
+    orderBy: { createdAt: 'desc' },
+    take: 20,
+    include: { attempts: { orderBy: { attemptNumber: 'desc' }, take: MAX_RECOVERY_ATTEMPTS } },
+  });
+  res.json({ autoRecoveryEnabled: project.autoRecoveryEnabled, activeVersionId: project.activeVersionId, sessions });
+});
+app.patch('/api/v1/projects/:id/recovery-settings', auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    const body = z.object({ enabled: z.boolean() }).strict().parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const updated = await prisma.project.updateMany({
+      where: { id: projectId, ownerId: (req as any).user.id },
+      data: { autoRecoveryEnabled: body.enabled },
+    });
+    if (!updated.count) return fail(res, 404, 'NOT_FOUND', 'Project not found');
+    res.json({ autoRecoveryEnabled: body.enabled });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/projects/:id/runtime-errors', rateLimit(20, 60_000), auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    const body = runtimeErrorReportSchema.parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, ownerId: (req as any).user.id },
+      select: { id: true, activeVersionId: true, autoRecoveryEnabled: true },
+    });
+    if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found');
+    if (project.activeVersionId !== body.versionId) return fail(res, 409, 'STALE_RUNTIME_REPORT', 'The runtime error belongs to an inactive project version.');
+    const decision = classifyRuntimeError(body);
+    if (decision === 'expected') return res.json({ ignored: true, reason: 'expected_request_failure' });
+
+    const normalized = normalizeRuntimeError(body);
+    const recent = await prisma.runtimeRecoverySession.findFirst({
+      where: { projectId, errorSignature: normalized.signature, createdAt: { gte: new Date(Date.now() - 10 * 60_000) } },
+      orderBy: { createdAt: 'desc' },
+      include: { attempts: { orderBy: { attemptNumber: 'desc' }, take: MAX_RECOVERY_ATTEMPTS } },
+    });
+    if (recent) return res.json({ session: recent, autoRecoveryEnabled: project.autoRecoveryEnabled, deduplicated: true });
+
+    const session = await prisma.runtimeRecoverySession.create({
+      data: {
+        projectId,
+        sourceVersionId: project.activeVersionId,
+        errorSignature: normalized.signature,
+        environment: normalized.environment,
+        category: normalized.category,
+        message: normalized.message,
+        stackTrace: normalized.stackTrace,
+        sourceFile: normalized.sourceFile,
+        line: normalized.line,
+        column: normalized.column,
+        status: decision === 'external_dependency' ? 'awaiting_approval' : 'detected',
+        failureReason: decision === 'external_dependency' ? 'Dependency and network failures require manual review.' : undefined,
+      },
+      include: { attempts: true },
+    });
+    await writeAudit((req as any).user.id, 'runtime_error.detected', session.id);
+    res.status(201).json({
+      session,
+      autoRecoveryEnabled: project.autoRecoveryEnabled,
+      autoEligible: decision === 'defect',
+    });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/projects/:id/recovery/:sessionId/attempts', rateLimit(10, 60_000), auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    const body = z.object({ manual: z.boolean().default(false) }).strict().parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const sessionId = z.string().min(1).max(64).parse(req.params.sessionId);
+    const ownerId = (req as any).user.id as string;
+    const session = await ownerRecoverySession(projectId, sessionId, ownerId);
+    if (!session) return fail(res, 404, 'NOT_FOUND', 'Recovery session not found');
+    if (session.status === 'paused') return fail(res, 409, 'RECOVERY_PAUSED', 'Resume this recovery session before retrying.');
+    if (['recovered', 'rolled_back', 'awaiting_approval'].includes(session.status)) return fail(res, 409, 'RECOVERY_NOT_RETRYABLE', 'This recovery session requires manual review or is already complete.');
+    if (session.attemptCount >= Math.min(session.maxAttempts, MAX_RECOVERY_ATTEMPTS)) return fail(res, 409, 'RECOVERY_LIMIT_REACHED', 'The automatic recovery attempt limit has been reached.');
+    if (session.attempts.some((attempt) => ['generating', 'validating'].includes(attempt.status))) return fail(res, 409, 'RECOVERY_IN_PROGRESS', 'A recovery attempt is already in progress.');
+
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, ownerId },
+      select: { id: true, activeVersionId: true },
+    });
+    if (!project?.activeVersionId) return fail(res, 409, 'RECOVERY_VERSION_MISSING', 'A saved project version is required for recovery.');
+    const currentVersion = await prisma.version.findFirst({
+      where: { id: project.activeVersionId, projectId },
+      select: { id: true, files: true },
+    });
+    if (!currentVersion) return fail(res, 409, 'RECOVERY_VERSION_MISSING', 'The active project version could not be loaded.');
+    if (containsCredentialLikeValue(currentVersion.files)) return fail(res, 409, 'RECOVERY_SECRET_REVIEW', 'Automatic recovery is disabled because project source contains credential-like values.');
+
+    const result = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${ownerId}), hashtext('runtime-recovery-daily'))`;
+      await tx.$queryRaw`SELECT "id" FROM "Project" WHERE "id" = ${projectId} AND "ownerId" = ${ownerId} FOR UPDATE`;
+      const lockedProject = await tx.project.findFirst({
+        where: { id: projectId, ownerId },
+        select: { activeVersionId: true, autoRecoveryEnabled: true },
+      });
+      if (!lockedProject || lockedProject.activeVersionId !== currentVersion.id) return { kind: 'version_changed' as const };
+      if (!body.manual && !lockedProject.autoRecoveryEnabled) return { kind: 'auto_disabled' as const };
+      const otherActiveSession = await tx.runtimeRecoverySession.findFirst({
+        where: { projectId, id: { not: sessionId }, status: { in: ['generating', 'validating'] } },
+        select: { id: true },
+      });
+      if (otherActiveSession) return { kind: 'project_busy' as const };
+      const dailyAttemptCount = await tx.runtimeRecoveryAttempt.count({
+        where: { startedAt: { gte: new Date(Date.now() - 24 * 60 * 60_000) }, session: { project: { ownerId } } },
+      });
+      if (dailyAttemptCount >= 10) return { kind: 'daily_limit' as const };
+      const current = await tx.runtimeRecoverySession.findFirst({
+        where: { id: sessionId, projectId, project: { ownerId } },
+        select: { attemptCount: true, maxAttempts: true, status: true },
+      });
+      if (!current || current.attemptCount >= Math.min(current.maxAttempts, MAX_RECOVERY_ATTEMPTS)) return { kind: 'state_changed' as const };
+      if (['generating', 'validating'].includes(current.status)) return { kind: 'in_progress' as const };
+      if (['paused', 'recovered', 'rolled_back', 'awaiting_approval'].includes(current.status)) return { kind: 'state_changed' as const };
+      const changed = await tx.runtimeRecoverySession.updateMany({
+        where: { id: sessionId, attemptCount: current.attemptCount, status: current.status },
+        data: { attemptCount: { increment: 1 }, status: 'generating', failureReason: null },
+      });
+      if (changed.count !== 1) return { kind: 'state_changed' as const };
+      const attempt = await tx.runtimeRecoveryAttempt.create({
+        data: {
+          sessionId,
+          attemptNumber: current.attemptCount + 1,
+          sourceVersionId: currentVersion.id,
+          status: 'generating',
+        },
+      });
+      return { kind: 'started' as const, attempt };
+    });
+    if (result.kind === 'daily_limit') return fail(res, 429, 'RECOVERY_DAILY_LIMIT', 'The daily automatic recovery limit has been reached.');
+    if (result.kind === 'auto_disabled') return fail(res, 403, 'AUTO_RECOVERY_DISABLED', 'Automatic recovery is disabled for this project.');
+    if (result.kind === 'project_busy' || result.kind === 'in_progress') return fail(res, 409, 'RECOVERY_IN_PROGRESS', 'Another recovery attempt is already active for this project.');
+    if (result.kind === 'version_changed') return fail(res, 409, 'RECOVERY_VERSION_CHANGED', 'Project files changed before recovery began. Refresh and try again.');
+    if (result.kind === 'state_changed') return fail(res, 409, 'RECOVERY_STATE_CHANGED', 'Recovery state changed. Refresh and try again.');
+    const attempt = result.attempt;
+    await writeAudit(ownerId, 'runtime_recovery.attempt_started', attempt.id);
+    const promptSession = await prisma.runtimeRecoverySession.findUnique({ where: { id: sessionId } });
+    if (!promptSession) return fail(res, 404, 'NOT_FOUND', 'Recovery session not found');
+    const promptError = normalizeRuntimeError(runtimeErrorReportSchema.parse({
+      versionId: promptSession.sourceVersionId,
+      environment: promptSession.environment,
+      category: promptSession.category,
+      message: promptSession.message,
+      stackTrace: promptSession.stackTrace ?? undefined,
+      sourceFile: promptSession.sourceFile ?? undefined,
+      line: promptSession.line ?? undefined,
+      column: promptSession.column ?? undefined,
+    }));
+    res.status(201).json({ attempt, prompt: createRecoveryPrompt(promptError) });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/projects/:id/recovery/:sessionId/attempts/:attemptId/validation', auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    const body = z.object({
+      candidateVersionId: z.string().min(1).max(64),
+      passed: z.boolean(),
+      message: z.string().max(1_000).optional(),
+      error: runtimeErrorReportSchema.optional(),
+    }).strict().parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const sessionId = z.string().min(1).max(64).parse(req.params.sessionId);
+    const attemptId = z.string().min(1).max(64).parse(req.params.attemptId);
+    const ownerId = (req as any).user.id as string;
+    const session = await ownerRecoverySession(projectId, sessionId, ownerId);
+    if (!session) return fail(res, 404, 'NOT_FOUND', 'Recovery session not found');
+    const attempt = session.attempts.find((entry) => entry.id === attemptId);
+    if (!attempt || attempt.status !== 'validating' || attempt.candidateVersionId !== body.candidateVersionId) return fail(res, 409, 'RECOVERY_CANDIDATE_MISMATCH', 'The candidate version is no longer awaiting validation.');
+    if (session.status !== 'validating') return fail(res, 409, 'RECOVERY_SESSION_NOT_VALIDATING', 'This recovery session is no longer awaiting preview validation.');
+    const project = await prisma.project.findFirst({ where: { id: projectId, ownerId }, select: { activeVersionId: true } });
+    if (!project || project.activeVersionId !== body.candidateVersionId) return fail(res, 409, 'RECOVERY_CANDIDATE_STALE', 'Project files changed before recovery validation completed.');
+    if (body.error && body.error.versionId !== body.candidateVersionId) return fail(res, 400, 'RECOVERY_DIAGNOSTIC_MISMATCH', 'The validation diagnostic must belong to the candidate version.');
+    if (body.passed && body.error) return fail(res, 400, 'RECOVERY_VALIDATION_CONFLICT', 'A successful preview validation cannot include a runtime error.');
+    const normalizedError = body.error ? normalizeRuntimeError(body.error) : undefined;
+    const errorDecision = normalizedError ? classifyRuntimeError(normalizedError) : 'defect';
+    const message = normalizedError?.message ?? (body.message ? redactRuntimeText(body.message).slice(0, 1_000) : undefined);
+
+    if (body.passed) {
+      await prisma.$transaction(async (tx) => {
+        const attemptUpdated = await tx.runtimeRecoveryAttempt.updateMany({
+          where: { id: attemptId, sessionId, status: 'validating', candidateVersionId: body.candidateVersionId },
+          data: { status: 'recovered', completedAt: new Date(), validation: { passed: true, message: message ?? null } },
+        });
+        if (attemptUpdated.count !== 1) throw new Error('Recovery validation changed before the result could be recorded.');
+        const sessionUpdated = await tx.runtimeRecoverySession.updateMany({
+          where: { id: sessionId, projectId, status: 'validating' },
+          data: { status: 'recovered', failureReason: null, resolvedAt: new Date() },
+        });
+        if (sessionUpdated.count !== 1) throw new Error('Recovery session changed before validation completed.');
+      });
+      await writeAudit(ownerId, 'runtime_recovery.recovered', sessionId);
+      return res.json({ status: 'recovered', retryAllowed: false });
+    }
+
+    const { requiresReview, retryAllowed } = recoveryRetryPolicy(attempt.attemptNumber, session.maxAttempts, errorDecision);
+    const failureReason = requiresReview
+      ? 'The candidate reported an environment or request failure that is not safe to repair automatically.'
+      : message ?? 'The candidate did not pass runtime validation.';
+    await prisma.$transaction(async (tx) => {
+      const rolledBack = await tx.project.updateMany({
+        where: { id: projectId, ownerId, activeVersionId: body.candidateVersionId },
+        data: { activeVersionId: attempt.sourceVersionId },
+      });
+      if (rolledBack.count !== 1) throw new Error('Recovery rollback lost its active-version compare-and-swap.');
+      const attemptUpdated = await tx.runtimeRecoveryAttempt.updateMany({
+        where: { id: attemptId, sessionId, status: 'validating', candidateVersionId: body.candidateVersionId },
+        data: { status: 'failed', failureReason, completedAt: new Date(), validation: { passed: false, message: message ?? null, error: normalizedError ?? null } },
+      });
+      if (attemptUpdated.count !== 1) throw new Error('Recovery attempt changed before validation completed.');
+      const sessionUpdated = await tx.runtimeRecoverySession.updateMany({
+        where: { id: sessionId, projectId, status: 'validating' },
+        data: {
+          status: requiresReview ? 'awaiting_approval' : retryAllowed ? 'retryable' : 'failed',
+          failureReason,
+          ...(normalizedError ? {
+            errorSignature: normalizedError.signature,
+            environment: normalizedError.environment,
+            category: normalizedError.category,
+            message: normalizedError.message,
+            stackTrace: normalizedError.stackTrace ?? null,
+            sourceFile: normalizedError.sourceFile ?? null,
+            line: normalizedError.line ?? null,
+            column: normalizedError.column ?? null,
+          } : {}),
+        },
+      });
+      if (sessionUpdated.count !== 1) throw new Error('Recovery session changed before validation completed.');
+    });
+    await writeAudit(ownerId, 'runtime_recovery.validation_failed', sessionId);
+    res.json({ status: requiresReview ? 'awaiting_approval' : retryAllowed ? 'retryable' : 'failed', retryAllowed, activeVersionId: attempt.sourceVersionId });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/projects/:id/recovery/:sessionId/pause', auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    z.object({}).strict().parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const sessionId = z.string().min(1).max(64).parse(req.params.sessionId);
+    const ownerId = (req as any).user.id as string;
+    const session = await ownerRecoverySession(projectId, sessionId, ownerId);
+    if (!session) return fail(res, 404, 'NOT_FOUND', 'Recovery session not found');
+    if (['recovered', 'rolled_back'].includes(session.status)) return fail(res, 409, 'RECOVERY_COMPLETE', 'This recovery session is already complete.');
+    const activeAttempt = await prisma.$transaction(async (tx) => {
+      const currentAttempt = await tx.runtimeRecoveryAttempt.findFirst({
+        where: { sessionId, status: { in: ['generating', 'validating'] } },
+        orderBy: { attemptNumber: 'desc' },
+      });
+      if (currentAttempt?.status === 'validating' && currentAttempt.candidateVersionId) {
+        const rolledBack = await tx.project.updateMany({
+          where: { id: projectId, ownerId, activeVersionId: currentAttempt.candidateVersionId },
+          data: { activeVersionId: currentAttempt.sourceVersionId },
+        });
+        if (rolledBack.count !== 1) throw new Error('Recovery pause could not safely restore the candidate version.');
+        const rolledBackAttempt = await tx.runtimeRecoveryAttempt.updateMany({
+          where: { id: currentAttempt.id, sessionId, status: 'validating' },
+          data: { status: 'rolled_back', failureReason: 'Recovery was paused before preview validation completed.', completedAt: new Date() },
+        });
+        if (rolledBackAttempt.count !== 1) throw new Error('Recovery attempt changed before it could be paused.');
+      } else if (currentAttempt?.status === 'generating') {
+        const cancelledAttempt = await tx.runtimeRecoveryAttempt.updateMany({
+          where: { id: currentAttempt.id, sessionId, status: 'generating' },
+          data: { status: 'cancelled', failureReason: 'Recovery was paused by the user.', completedAt: new Date() },
+        });
+        if (cancelledAttempt.count !== 1) throw new Error('Recovery attempt changed before it could be paused.');
+      }
+      const paused = await tx.runtimeRecoverySession.updateMany({
+        where: { id: sessionId, projectId, status: { notIn: ['recovered', 'rolled_back', 'failed', 'awaiting_approval'] } },
+        data: { status: 'paused' },
+      });
+      if (paused.count !== 1) throw new Error('Recovery session changed before it could be paused.');
+      return currentAttempt;
+    });
+    if (activeAttempt?.generationJobId) activeControllers.get(activeAttempt.generationJobId)?.abort(new Error('Recovery paused by user'));
+    res.json({ status: 'paused' });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/projects/:id/recovery/:sessionId/resume', auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    z.object({}).strict().parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const sessionId = z.string().min(1).max(64).parse(req.params.sessionId);
+    const ownerId = (req as any).user.id as string;
+    const session = await ownerRecoverySession(projectId, sessionId, ownerId);
+    if (!session) return fail(res, 404, 'NOT_FOUND', 'Recovery session not found');
+    const updated = await prisma.runtimeRecoverySession.updateMany({
+      where: { id: sessionId, projectId, status: 'paused', attemptCount: { lt: Math.min(session.maxAttempts, MAX_RECOVERY_ATTEMPTS) } },
+      data: { status: 'retryable', failureReason: null },
+    });
+    if (!updated.count) return fail(res, 409, 'RECOVERY_NOT_RESUMABLE', 'This recovery session cannot be resumed.');
+    res.json({ status: 'retryable' });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/projects/:id/recovery/:sessionId/rollback', auth, requireRuntimeRecoverySchema, async (req, res, next) => {
+  try {
+    z.object({}).strict().parse(req.body);
+    const projectId = z.string().min(1).max(64).parse(req.params.id);
+    const sessionId = z.string().min(1).max(64).parse(req.params.sessionId);
+    const ownerId = (req as any).user.id as string;
+    const session = await ownerRecoverySession(projectId, sessionId, ownerId);
+    if (!session) return fail(res, 404, 'NOT_FOUND', 'Recovery session not found');
+    if (session.status === 'generating') return fail(res, 409, 'RECOVERY_IN_PROGRESS', 'Wait for recovery generation to stop before restoring a version.');
+    const latestCandidate = session.attempts.find((attempt) => attempt.candidateVersionId);
+    if (!latestCandidate?.candidateVersionId) return fail(res, 409, 'RECOVERY_NO_CANDIDATE', 'This session has no saved correction to roll back.');
+    await prisma.$transaction(async (tx) => {
+      const currentProject = await tx.project.findFirst({ where: { id: projectId, ownerId }, select: { activeVersionId: true } });
+      if (currentProject?.activeVersionId !== latestCandidate.candidateVersionId) throw new Error('Recovery rollback lost its active-version compare-and-swap.');
+      const rolledBack = await tx.project.updateMany({
+        where: { id: projectId, ownerId, activeVersionId: latestCandidate.candidateVersionId },
+        data: { activeVersionId: latestCandidate.sourceVersionId },
+      });
+      if (rolledBack.count !== 1) throw new Error('Recovery rollback lost its active-version compare-and-swap.');
+      const attemptUpdated = await tx.runtimeRecoveryAttempt.updateMany({
+        where: { id: latestCandidate.id, sessionId, candidateVersionId: latestCandidate.candidateVersionId, status: { in: ['validating', 'recovered'] } },
+        data: { status: 'rolled_back', completedAt: new Date() },
+      });
+      if (attemptUpdated.count !== 1) throw new Error('Recovery attempt changed before rollback completed.');
+      const sessionUpdated = await tx.runtimeRecoverySession.updateMany({
+        where: { id: sessionId, projectId, status: { in: ['validating', 'recovered'] } },
+        data: { status: 'rolled_back', failureReason: null },
+      });
+      if (sessionUpdated.count !== 1) throw new Error('Recovery session changed before rollback completed.');
+    });
+    await writeAudit(ownerId, 'runtime_recovery.rolled_back', sessionId);
+    res.json({ status: 'rolled_back', activeVersionId: latestCandidate.sourceVersionId });
+  } catch (error) { next(error); }
+});
 
 app.get('/api/v1/usage/me', auth, async (req, res) => {
   const userId = (req as any).user.id as string; const since = new Date(Date.now() - 30 * 86400000);
@@ -595,9 +1093,36 @@ app.post('/api/v1/projects/:id/github/pull-request', rateLimit(2, 60 * 60_000, f
 });
 app.post('/api/v1/projects/:id/generations', rateLimit(10, 60_000, false), auth, async (req, res, next) => {
   try {
-    const body = z.object({ prompt: z.string().trim().min(1).max(4000), templateId: z.enum(['restaurant', 'saas', 'portfolio']).default('saas'), options: z.record(z.string(), z.unknown()).default({}), mode: z.enum(['create', 'revise']).default('create') }).strict().parse(req.body);
+    const body = z.object({
+      prompt: z.string().trim().min(1).max(4000),
+      templateId: z.enum(['restaurant', 'saas', 'portfolio']).default('saas'),
+      options: z.record(z.string(), z.unknown()).default({}),
+      mode: z.enum(['create', 'revise']).default('create'),
+      recoveryAttemptId: z.string().min(1).max(64).optional(),
+    }).strict().parse(req.body);
     const userId = (req as any).user.id as string; const project = await ownerProject(z.string().min(1).max(64).parse(req.params.id), userId);
     if (!project) return fail(res, 404, 'NOT_FOUND', 'Project not found');
+    if (body.recoveryAttemptId && body.mode !== 'revise') return fail(res, 400, 'RECOVERY_REQUIRES_REVISION', 'Recovery attempts must revise a saved project version.');
+    const recoveryReady = await hasRuntimeRecoverySchema();
+    if (body.recoveryAttemptId && !recoveryReady) return fail(res, 503, 'SCHEMA_NOT_READY', 'A required database migration has not been applied.');
+    const activeRecovery = recoveryReady
+      ? await prisma.runtimeRecoverySession.findFirst({
+        where: { projectId: project.id, status: { in: ['generating', 'validating'] } },
+        select: { id: true },
+      })
+      : null;
+    if (activeRecovery && !body.recoveryAttemptId) return fail(res, 409, 'RECOVERY_IN_PROGRESS', 'Pause or finish autonomous recovery before starting another generation.');
+    const recoveryAttempt = body.recoveryAttemptId
+      ? await prisma.runtimeRecoveryAttempt.findFirst({
+        where: {
+          id: body.recoveryAttemptId,
+          status: 'generating',
+          sourceVersionId: project.activeVersionId ?? '',
+          session: { is: { projectId: project.id, status: 'generating', project: { is: { ownerId: userId } } } },
+        },
+      })
+      : null;
+    if (body.recoveryAttemptId && !recoveryAttempt) return fail(res, 409, 'RECOVERY_ATTEMPT_STALE', 'The recovery attempt is no longer active for this project version.');
     const headerKey = req.get('idempotency-key');
     if (headerKey && !/^[a-zA-Z0-9._:-]{8,100}$/.test(headerKey)) return fail(res, 400, 'INVALID_IDEMPOTENCY_KEY', 'Idempotency-Key must be 8 to 100 safe characters');
     const requestKey = headerKey ? `${userId}:${headerKey}` : undefined;
@@ -615,35 +1140,68 @@ app.post('/api/v1/projects/:id/generations', rateLimit(10, 60_000, false), auth,
     if (daily >= 20) return fail(res, 429, 'QUOTA_EXCEEDED', 'Daily generation limit reached');
     if (active >= 2) return fail(res, 429, 'CONCURRENCY_LIMIT', 'Two generations are already running');
     if (globalActive >= 20) return fail(res, 429, 'SERVER_CONCURRENCY_LIMIT', 'Generation capacity is full');
-    const activeVersion = project.versions.find((item) => item.id === project.activeVersionId) ?? project.versions.at(-1);
+    const activeVersion = project.activeVersionId
+      ? await prisma.version.findFirst({ where: { id: project.activeVersionId, projectId: project.id }, select: { files: true } })
+      : project.versions[0];
     const contextFiles = activeVersion?.files ?? [];
     if (Buffer.byteLength(JSON.stringify(contextFiles), 'utf8') > 50_000) return fail(res, 413, 'CONTEXT_TOO_LARGE', 'Current project context exceeds 50 KB');
-    const job = await prisma.generationJob.create({ data: { projectId: project.id, prompt: body.prompt, status: 'queued', requestKey, contextFiles: contextFiles as any } });
+    const job = await prisma.$transaction(async (tx) => {
+      const created = await tx.generationJob.create({ data: { projectId: project.id, prompt: body.prompt, status: 'queued', requestKey, contextFiles: contextFiles as any } });
+      if (recoveryAttempt) {
+        const linked = await tx.runtimeRecoveryAttempt.updateMany({
+          where: { id: recoveryAttempt.id, status: 'generating', generationJobId: null },
+          data: { generationJobId: created.id },
+        });
+        if (linked.count !== 1) throw new Error('Recovery attempt was already linked to a generation.');
+      }
+      return created;
+    });
     await writeAudit(userId, 'generation.started', job.id);
     res.status(202).json({ job: { id: job.id, status: job.status, progress: 0 } });
     void generate(job.id, project.id, userId, { ...body, contextFiles }).catch((error) => logger.error({ errorName: error instanceof Error ? error.name : 'UnknownError', jobId: job.id, providerFailures: error instanceof GenerationFailure ? error.failures : undefined }, 'generation failed'));
   } catch (error) { next(error); }
 });
-async function generate(jobId: string, projectId: string, userId: string, input: { prompt: string; templateId: string; options: Record<string, unknown>; mode: 'create' | 'revise'; contextFiles: unknown }) {
+async function generate(jobId: string, projectId: string, userId: string, input: { prompt: string; templateId: string; options: Record<string, unknown>; mode: 'create' | 'revise'; contextFiles: unknown; recoveryAttemptId?: string }) {
   const controller = new AbortController(); activeControllers.set(jobId, controller);
   await prisma.generationJob.update({ where: { id: jobId }, data: { status: 'running' } });
   try {
+  const recoveryAttempt = input.recoveryAttemptId
+    ? await prisma.runtimeRecoveryAttempt.findFirst({
+      where: { id: input.recoveryAttemptId, generationJobId: jobId, status: 'generating', session: { is: { status: 'generating', projectId } } },
+      include: { session: true },
+    })
+    : null;
+  if (input.recoveryAttemptId && !recoveryAttempt) throw new RecoveryNeedsApprovalError('The recovery session changed before analysis started.');
+  if (recoveryAttempt && containsCredentialLikeValue(input.contextFiles)) {
+    throw new RecoveryNeedsApprovalError('Credential-like values were found in project source; automatic analysis was stopped.');
+  }
   publishGeneration(jobId, 'stage', { id: 'planning', label: 'Analyzing requirements and planning the file structure' });
   const generated = await generateVanillaWebsiteWithFallback(
-    { prompt: input.prompt, currentFiles: input.contextFiles, mode: input.mode },
     {
-      groq: {
+      prompt: composeWebsitePrompt(input.prompt, input.templateId, input.options),
+      currentFiles: input.contextFiles,
+      mode: input.mode,
+      requireNavigation: input.options.menuBar !== false,
+    },
+    {
+      providerOrder,
+      singleRequestMode,
+      ...(process.env.GROQ_API_KEY ? { groq: {
         baseUrl: groqBaseUrl,
-        apiKey: process.env.GROQ_API_KEY!,
-        model: input.mode === 'create' ? aiModels.coding : aiModels.reasoning,
-        timeoutMs: groqTimeoutMs,
-      },
-      gemini: {
+        apiKey: process.env.GROQ_API_KEY,
+        model: process.env.GROQ_MODEL || (input.mode === 'create' ? aiModels.coding : aiModels.reasoning),
+        firstByteTimeoutMs,
+        streamIdleTimeoutMs,
+        totalDeadlineMs,
+      } } : {}),
+      ...(process.env.GEMINI_API_KEY ? { gemini: {
         baseUrl: geminiBaseUrl,
-        apiKey: process.env.GEMINI_API_KEY!,
+        apiKey: process.env.GEMINI_API_KEY,
         model: aiModels.fallback,
-        timeoutMs: geminiTimeoutMs,
-      },
+        firstByteTimeoutMs,
+        streamIdleTimeoutMs,
+        totalDeadlineMs,
+      } } : {}),
       ...(openRouterConfig ? { openRouter: openRouterConfig } : {}),
       totalTimeoutMs: generationTotalTimeoutMs,
       ...(huggingFaceConfig ? { huggingFace: huggingFaceConfig } : {}),
@@ -653,27 +1211,116 @@ async function generate(jobId: string, projectId: string, userId: string, input:
     (event: GenerationEvent) => {
       if (event.type === 'provider') publishGeneration(jobId, 'stage', { id: 'generating', label: 'Generating project files with AI' });
       if (event.type === 'delta') publishGeneration(jobId, 'delta', { provider: event.provider, characters: event.text.length });
-      if (event.type === 'provider' || event.type === 'file' || event.type === 'file_started' || event.type === 'file_delta' || event.type === 'retry') publishGeneration(jobId, event.type, event);
+      if (event.type === 'provider_attempt') logger.info({ jobId, ...event }, 'provider_attempt');
+      if (event.type === 'provider' || event.type === 'provider_attempt' || event.type === 'file' || event.type === 'file_started' || event.type === 'file_delta' || event.type === 'retry') publishGeneration(jobId, event.type, event);
     },
-    (event: GeminiDiagnosticEvent) => logger.info({ jobId, model: aiModels.fallback, ...event }, 'Gemini request diagnostic'),
+    (event: GeminiDiagnosticEvent) => logger.info(
+      { jobId, ...event, ...(event.provider === 'groq' ? { status: event.status ?? null, inputTokens: event.inputTokens ?? 0, outputTokens: event.outputTokens ?? 0 } : {}) },
+      event.provider === 'groq' ? 'Groq provider request metrics' : event.stage === 'timeout' ? 'provider timeout fired' : 'provider request diagnostic',
+    ),
   );
+  if (recoveryAttempt) {
+    try { validateRecoveryPatch(input.contextFiles, generated.files); }
+    catch (error) {
+      throw new RecoveryNeedsApprovalError(error instanceof Error ? error.message : 'The proposed patch failed safety validation.');
+    }
+  }
   const files = mergeGeneratedFiles(input.contextFiles, generated.files, input.mode);
   publishGeneration(jobId, 'stage', { id: 'validating', label: 'Checking responsive website output' });
   if (!files.some((file) => file.path === 'package.json') && ['index.html', 'styles.css', 'app.js'].every((path) => files.some((file) => file.path === path))) {
-    validateVanillaProject(files, generated.provider ?? 'gemini');
+    validateVanillaProject(files, generated.provider ?? 'gemini', { requireNavigation: input.options.menuBar !== false });
   }
   for (const file of files) publishGeneration(jobId, 'file', { path: file.path });
+  if (!recoveryAttempt) {
+    publishGeneration(jobId, 'preview_ready', {
+      summary: generated.summary,
+      files,
+      warnings: generated.warnings,
+      provider: generated.provider,
+    });
+  }
   publishGeneration(jobId, 'stage', { id: 'saving', label: 'Saving the project version to Supabase' });
-  const version = await persistGeneratedVersion(prisma, { jobId, projectId, userId, prompt: input.prompt, templateId: input.templateId, options: input.options, generated: { ...generated, files } });
-  publishGeneration(jobId, 'complete', { status: 'complete', versionId: version.id });
-  return version;
+  const persistenceInput: Parameters<typeof persistGeneratedVersion>[1] = {
+    jobId,
+    projectId,
+    userId,
+    prompt: input.prompt,
+    templateId: input.templateId,
+    options: input.options,
+    generated: { ...generated, files },
+    ...(recoveryAttempt ? { expectedActiveVersionId: recoveryAttempt.sourceVersionId, recoveryAttemptId: recoveryAttempt.id } : {}),
+  };
+  const saveResult = await persistOrKeepPreview(
+    () => persistGeneratedVersion(prisma, persistenceInput),
+    { summary: generated.summary, files, warnings: generated.warnings },
+  );
+  if (saveResult.state === 'saved') {
+    const version = saveResult.value;
+    setGenerationSaveState(jobId, { state: 'saved', versionId: version.id });
+    await writeAudit(userId, 'generation.completed', jobId);
+    publishGeneration(jobId, 'complete', { status: 'complete', versionId: version.id, saved: true });
+    return version;
+  } else {
+    const error = saveResult.error;
+    if (error instanceof ProjectVersionConflictError || recoveryAttempt) throw error;
+    logger.warn({
+      jobId,
+      category: databaseFailureCategory(error),
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    }, 'generated preview is ready, but Supabase persistence failed; retrying in the background');
+    scheduleVersionPersistenceRetry(jobId, persistenceInput);
+    const saveState = generationSaveStates.get(jobId)?.state ?? 'failed';
+    await writeAudit(userId, 'generation.preview_ready', jobId);
+    publishGeneration(jobId, 'complete', {
+      status: 'complete',
+      saved: false,
+      saveState,
+      warning: saveState === 'retrying'
+        ? 'The preview is ready. Saving to your account is retrying in the background.'
+        : 'The preview is ready in this browser session, but automatic saving could not be queued.',
+    });
+    return undefined;
+  }
   } catch (error) {
     const errorCode = controller.signal.aborted
       ? 'CANCELLED'
       : error instanceof GenerationFailure ? storedGenerationFailure(error.message) : 'GENERATION_FAILED';
     await prisma.generationJob.update({ where: { id: jobId }, data: { status: controller.signal.aborted ? 'cancelled' : 'failed', errorCode, finishedAt: new Date() } });
     await writeAudit(userId, controller.signal.aborted ? 'generation.cancelled' : 'generation.failed', jobId);
-    const errorMessage = error instanceof GenerationFailure ? error.message : 'AI generation did not complete. The previous version remains available.';
+    const recoveryError = error instanceof RecoveryNeedsApprovalError;
+    const recoveryMessage = recoveryError ? error.message : error instanceof ProjectVersionConflictError ? 'Project files changed while the correction was generated. No patch was applied.' : undefined;
+    if (input.recoveryAttemptId) {
+      const currentAttempt = await prisma.runtimeRecoveryAttempt.findUnique({
+        where: { id: input.recoveryAttemptId },
+        include: { session: { select: { id: true, status: true, attemptCount: true, maxAttempts: true } } },
+      });
+      if (currentAttempt && currentAttempt.status === 'generating') {
+        const paused = currentAttempt.session.status === 'paused';
+        const status = paused ? 'cancelled' : recoveryError ? 'awaiting_approval' : 'failed';
+        await prisma.$transaction(async (tx) => {
+          await tx.runtimeRecoveryAttempt.updateMany({
+            where: { id: currentAttempt.id, status: 'generating' },
+            data: {
+              status,
+              failureReason: paused ? 'Recovery was paused by the user.' : recoveryMessage ?? 'The recovery generation did not complete.',
+              completedAt: new Date(),
+              validation: { passed: false, state: paused ? 'paused' : recoveryError ? 'approval_required' : 'generation_failed' },
+            },
+          });
+          if (!paused) {
+            await tx.runtimeRecoverySession.updateMany({
+              where: { id: currentAttempt.session.id, status: { not: 'paused' } },
+              data: {
+                status: recoveryError ? 'awaiting_approval' : 'failed',
+                failureReason: recoveryMessage ?? 'The recovery generation did not complete.',
+              },
+            });
+          }
+        });
+      }
+    }
+    const errorMessage = recoveryMessage
+      ?? (error instanceof GenerationFailure ? error.message : 'AI generation did not complete. The previous version remains available.');
     publishGeneration(jobId, controller.signal.aborted ? 'cancelled' : 'failed', { status: controller.signal.aborted ? 'cancelled' : 'failed', error: controller.signal.aborted ? 'Generation was cancelled.' : errorMessage });
     throw error;
   } finally { activeControllers.delete(jobId); }
@@ -682,7 +1329,17 @@ app.get('/api/v1/generations/:jobId', auth, async (req, res) => {
   const id = z.string().min(1).max(64).parse(req.params.jobId);
   const job = await prisma.generationJob.findFirst({ where: { id, project: { ownerId: (req as any).user.id } } });
   if (!job) return fail(res, 404, 'NOT_FOUND', 'Generation not found');
-  res.json({ job: { id: job.id, status: job.status, progress: job.status === 'complete' ? 100 : job.status === 'queued' ? 0 : null, errorCode: job.errorCode } });
+  const saveState = generationSaveStates.get(id);
+  const status = saveState && saveState.state !== 'saved' ? 'complete' : job.status;
+  res.json({
+    job: {
+      id: job.id,
+      status,
+      progress: status === 'complete' ? 100 : status === 'queued' ? 0 : null,
+      errorCode: job.errorCode,
+      ...(saveState ? { saveState: saveState.state, ...(saveState.versionId ? { versionId: saveState.versionId } : {}) } : {}),
+    },
+  });
 });
 app.get('/api/v1/generations/:jobId/events', auth, async (req, res) => {
   const id = z.string().min(1).max(64).parse(req.params.jobId);
@@ -735,7 +1392,11 @@ app.post('/api/v1/generations/:jobId/cancel', auth, async (req, res) => {
     if (err?.type === 'entity.too.large') return fail(res, 413, 'BODY_TOO_LARGE', 'Request body exceeds 1 MB');
     if (err?.type === 'entity.parse.failed') return fail(res, 400, 'INVALID_JSON', 'Request body must be valid JSON');
     if (err?.code === 'P2002') return fail(res, 409, 'CONFLICT', 'Resource already exists');
-    if (['P1000', 'P1001', 'P1002', 'P1008', 'P1017', 'P2010', 'P2021'].includes(err?.code)) {
+    if (['P2021', 'P2022'].includes(err?.code)) {
+      logger.error({ code: err.code }, 'database schema migration required');
+      return fail(res, 503, 'SCHEMA_NOT_READY', 'A required database migration has not been applied.');
+    }
+    if (['P1000', 'P1001', 'P1002', 'P1008', 'P1017', 'P2010'].includes(err?.code)) {
       logger.error({ code: err.code }, 'database request unavailable');
       return fail(res, 503, 'DATABASE_UNAVAILABLE', 'Account and project storage is temporarily unavailable.');
     }
@@ -751,11 +1412,15 @@ server.headersTimeout = 10_000;
 server.requestTimeout = 30_000;
 server.keepAliveTimeout = 5_000;
 
-let shutdownStarted = false;
 async function shutdown(signal: NodeJS.Signals) {
   if (shutdownStarted) return;
   shutdownStarted = true;
   logger.info({ signal }, 'D-GUY API graceful shutdown started');
+  if (pendingVersionSaves.size > 0) {
+    logger.warn({ pendingSaves: pendingVersionSaves.size }, 'background save retries will pause during shutdown');
+    for (const pending of pendingVersionSaves.values()) if (pending.timer) clearTimeout(pending.timer);
+  }
+  pendingVersionSaves.clear();
   for (const controller of activeControllers.values()) controller.abort(new Error('API is shutting down'));
   for (const clients of generationClients.values()) for (const client of clients) client.end();
   generationClients.clear();

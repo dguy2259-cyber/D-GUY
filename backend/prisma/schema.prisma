@@ -37,12 +37,14 @@ model Project {
   ownerId        String
   name           String
   messages       Json           @default("[]")
+  autoRecoveryEnabled Boolean   @default(false)
   activeVersionId String?
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
   owner          User           @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   versions       Version[]
   jobs           GenerationJob[]
+  recoverySessions RuntimeRecoverySession[]
 
   @@index([ownerId, updatedAt])
 }
@@ -108,4 +110,50 @@ model ApiRateLimitBucket {
   resetAt DateTime
 
   @@index([resetAt])
+}
+
+model RuntimeRecoverySession {
+  id              String   @id @default(cuid())
+  projectId       String
+  sourceVersionId String
+  errorSignature String
+  environment     String
+  category        String
+  message         String
+  stackTrace      String?
+  sourceFile      String?
+  line            Int?
+  column          Int?
+  status          String   @default("detected")
+  attemptCount    Int      @default(0)
+  maxAttempts     Int      @default(5)
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  resolvedAt      DateTime?
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  attempts        RuntimeRecoveryAttempt[]
+
+  @@index([projectId, createdAt])
+  @@index([projectId, errorSignature, createdAt])
+  @@index([projectId, status, updatedAt])
+}
+
+model RuntimeRecoveryAttempt {
+  id                String   @id @default(cuid())
+  sessionId         String
+  attemptNumber     Int
+  status            String   @default("generating")
+  sourceVersionId   String
+  candidateVersionId String?
+  generationJobId   String?
+  failureReason     String?
+  validation        Json     @default("{}")
+  startedAt         DateTime @default(now())
+  completedAt       DateTime?
+  session           RuntimeRecoverySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, attemptNumber])
+  @@index([sessionId, startedAt])
+  @@index([generationJobId])
 }

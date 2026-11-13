@@ -116,6 +116,18 @@ The Nginx web service is the single host entry point. By default it binds to `12
 
 Compose builds a static Vite bundle served by unprivileged Nginx, runs the API independently as a non-root Node process, waits for API readiness before starting web, restarts failed containers, limits CPU/memory/PIDs, drops Linux capabilities, uses read-only root filesystems, and rotates Docker JSON logs. Only the web port is published. The API has a private network connection to web and an outbound network for Supabase and configured providers.
 
+## Vercel production deployment
+
+`vercel.json` defines two independently built Vercel Services: the Vite frontend and the existing Express API container. The public `/api/*` path is routed to the API service, and all other paths go to the frontend. This keeps authentication cookies same-origin and does not run the Vite development server. Vercel Services and container services are currently Beta features; confirm availability and container/function limits in the target Vercel account before production use.
+
+1. Link the repository to the intended Vercel project with `vercel link`. Keep Vercel environment values in Project Settings; do not copy `backend/.env` into the repository or pass private values as Docker build arguments.
+2. Set the frontend's Production build variables: `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. The anon key is public; never set a service-role key as a `VITE_*` variable.
+3. Set the API service's Production runtime variables in Vercel Project Settings. Required values include `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `FRONTEND_ORIGIN` (the exact final HTTPS Vercel/custom-domain origin), `COOKIE_SECURE=true`, `TRUST_PROXY=1`, `AI_PROVIDER=groq`, `AI_FALLBACK_PROVIDER=gemini`, and at least one configured provider key. Add the configured model and timeout variables from `backend/.env.example`; when enabling OpenRouter, also set `OPENROUTER_MODEL`. Use only the backend service's runtime environment for private credentials.
+4. Configure Supabase Auth Site URL and allowed redirect URLs for the exact production origin, including `/auth/callback`; configure SMTP and Google OAuth in Supabase if those flows are needed. Do not apply database migrations from a deployment build. Check the target database and migration state first, and apply reviewed migrations separately.
+5. After signing in to Vercel and setting the project environment, deploy with `vercel deploy --prod`. Verify the Vercel deployment's frontend, `/api/v1/health`, `/api/v1/ready`, registration/login, and a real generated project before treating it as production-ready. Provider generation may incur charges.
+
+This repository does not contain Vercel account credentials or production secrets. A production deployment cannot become functional until the Vercel project is linked, required environment variables are configured securely in Vercel, the production origin is allowed in Supabase, and the deployment is verified against the intended database.
+
 ## API routes
 
 All API routes are under `/api/v1`; the browser's centralized service is `src/services/backendApi.ts`.
@@ -128,6 +140,22 @@ All API routes are under `/api/v1`; the browser's centralized service is `src/se
 - `/projects/:id/export.zip` and `/usage/me`.
 
 Request failures use `{ "error": { "code": "...", "message": "..." } }`. CORS permits exact `FRONTEND_ORIGIN` values. Production browser requests are same-origin through Nginx. Health/readiness do not by themselves prove Auth or provider credentials work.
+
+## Isolated runtime error recovery
+
+The authenticated workspace can record JavaScript runtime and unhandled-rejection errors from generated HTML iframes and supported WebContainer previews. Open **Autonomous Error Recovery** from the sidebar to review incidents, inspect redacted diagnostics, pause/resume work, retry, and restore the last known-good version.
+
+Automatic AI repair is disabled by default per project. Enabling it allows the configured provider to make bounded source-only corrections; the server caps an incident at five attempts and an account at ten attempts in a rolling 24-hour window. Authentication, security, database, dependency, and deployment changes are rejected for human review. Runtime reports and generated patches are validated server-side, recovery writes compare-and-swap the active version, and a failed preview restores the prior version without deleting history.
+
+The additive Prisma migration `backend/prisma/migrations/20261113190000_runtime_recovery` must be reviewed and intentionally applied to the intended database before these routes can persist incidents. Normal server startup does not apply migrations. Check the target and backup before running the documented migration command; do not apply it to production without explicit approval.
+
+Recovery API routes are under `/api/v1`:
+
+- `GET /projects/:id/recovery` and `PATCH /projects/:id/recovery-settings`
+- `POST /projects/:id/runtime-errors`
+- `POST /projects/:id/recovery/:sessionId/attempts`
+- `POST /projects/:id/recovery/:sessionId/attempts/:attemptId/validation`
+- `POST /projects/:id/recovery/:sessionId/pause`, `/resume`, and `/rollback`
 
 ## Development checks
 

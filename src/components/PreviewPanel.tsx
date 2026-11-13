@@ -8,7 +8,7 @@ import { StatusBadge } from '@/components/StatusBadge';
 import { formatSeconds } from '@/utils/formatSeconds';
 import type { GenerationState } from '@/hooks/useWorkspace';
 import { useNow } from '@/hooks/useNow';
-import type { PreviewStatus, SiteVersion, ViewportMode } from '@/types/project';
+import type { PreviewStatus, RuntimeErrorReport, SiteVersion, ViewportMode } from '@/types/project';
 
 export type PreviewTab = 'preview' | 'code' | 'files';
 
@@ -32,7 +32,8 @@ interface PreviewPanelProps {
   onRefresh: () => void;
   onOpenFullscreen: () => void;
   onDownload: () => void;
-  onRuntimeError?: (message: string) => void;
+  onRuntimeError?: (report: RuntimeErrorReport) => void;
+  onPreviewReady?: (versionId: string) => void;
   onCreatePullRequest: () => void;
   onPrepareDeployment: () => void;
 }
@@ -52,6 +53,7 @@ export function PreviewPanel({
   onOpenFullscreen,
   onDownload,
   onRuntimeError,
+  onPreviewReady,
   onCreatePullRequest,
   onPrepareDeployment,
 }: PreviewPanelProps) {
@@ -151,6 +153,7 @@ export function PreviewPanel({
                   refreshKey={refreshKey}
                   buildingLabel={currentStage ? currentStage.label : null}
                   onRuntimeError={onRuntimeError}
+                  onPreviewReady={onPreviewReady}
                 />
               </div>
             </div>

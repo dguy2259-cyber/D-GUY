@@ -10,17 +10,30 @@ export interface SiteOptions {
   palette: PaletteId;
   testimonials: boolean;
   premiumHero: boolean;
+  menuBar: boolean;
 }
 
 export interface RequirementOverrides {
   templateId: TemplateId | null;
   palette: PaletteId | null;
   testimonials: boolean | null;
+  menuBar: boolean | null;
 }
 
 export interface ProjectFile {
   path: string;
   content: string;
+}
+
+export interface RuntimeErrorReport {
+  versionId: string;
+  environment: 'sandbox_html' | 'webcontainer';
+  category: 'runtime' | 'unhandled_rejection' | 'compile' | 'startup' | 'dependency';
+  message: string;
+  stackTrace?: string;
+  sourceFile?: string;
+  line?: number;
+  column?: number;
 }
 
 export interface SiteVersion {

@@ -14,7 +14,7 @@ const EXAMPLE_PROMPTS = [
   'E-commerce storefront',
 ];
 
-const NO_REQUIREMENTS: RequirementOverrides = { templateId: null, palette: null, testimonials: null };
+const NO_REQUIREMENTS: RequirementOverrides = { templateId: null, palette: null, testimonials: null, menuBar: null };
 
 interface ChatPanelProps {
   project: WorkspaceProject;

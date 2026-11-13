@@ -31,6 +31,13 @@ export function GenerationProgress({ generation }: GenerationProgressProps) {
         {running && <span className="font-mono text-xs text-stone">{formatSeconds(elapsed)}</span>}
       </div>
 
+      {generation.saveState === 'retrying' && (
+        <p role="status" className="mt-3 text-sm text-stone">{generation.saveWarning || 'Preview ready; saving the version in the background.'}</p>
+      )}
+      {generation.saveState === 'failed' && (
+        <p role="alert" className="mt-3 text-sm text-[#8A3A32]">{generation.saveWarning || 'Preview is ready, but the project version was not saved.'}</p>
+      )}
+
       {generation.status === 'error' ? (
         <p className="mt-3 flex items-start gap-2 text-sm text-[#8A3A32]">
           <AlertCircle size={16} className="mt-0.5 shrink-0" />
