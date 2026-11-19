@@ -5,7 +5,7 @@ import { config as loadEnv } from 'dotenv';
 import { fileURLToPath } from 'node:url';
 loadEnv({ path: fileURLToPath(new URL('../.env', import.meta.url)) });
 import express from 'express';
-import * as helmetModule from 'helmet';
+import helmet from "helmet";
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import pino from 'pino';
@@ -153,7 +153,7 @@ app.use((req, res, next) => {
   res.on('finish', () => logger.info({ requestId, method: req.method, path: req.path, status: res.statusCode, durationMs: Date.now() - started }));
   next();
 });
-app.use(helmetModule.default());
+app.use(helmet());
 const origins = [...new Set((process.env.FRONTEND_ORIGIN || 'http://localhost:5173').split(',').map((s) => s.trim()))];
 for (const origin of origins) {
   const parsed = new URL(origin);
