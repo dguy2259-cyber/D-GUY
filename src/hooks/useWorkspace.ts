@@ -50,7 +50,7 @@ function fromApiProject(value: ApiProject): WorkspaceProject {
         palette: typeof palette === 'string' && palette in palettes ? palette as SiteOptions['palette'] : 'clay',
         testimonials: rawOptions.testimonials === true,
         premiumHero: rawOptions.premiumHero === true,
-        menuBar: rawOptions.menuBar !== false,
+        navigation: rawOptions.navigation !== false,
       },
       files, createdAt: new Date(version.createdAt).getTime(),
       previewMode: files.some((file) => file.path.toLowerCase() === 'index.html') ? 'sandbox-html' as const : 'static-files' as const,
@@ -146,9 +146,9 @@ export function useWorkspace(persistentUserId: string | null) {
       try {
         const { job } = await backendApi.generation(jobId, controller.signal);
         if (job.saveState === 'failed') {
-          lastError = 'The preview is available, but automatic saving did not succeed. Try saving again by generating a revision.';
+          lastError = 'Files generated, but saving failed. Your previous saved version remains active. Try again later.';
           setGeneration((current) => current.projectId === projectId
-            ? { ...current, saveState: 'failed', saveWarning: lastError }
+            ? { ...current, status: 'error', error: lastError, saveState: 'failed', saveWarning: lastError }
             : current);
           savePollsRef.current.delete(jobId);
           return;
@@ -162,7 +162,7 @@ export function useWorkspace(persistentUserId: string | null) {
               : project),
           }));
           setGeneration((current) => current.projectId === projectId
-            ? { ...current, saveState: 'saved', saveWarning: undefined }
+            ? { ...current, status: 'complete', stageIndex: current.stages.length, finishedAt: Date.now(), error: undefined, saveState: 'saved', saveWarning: undefined }
             : current);
           savePollsRef.current.delete(jobId);
           return;
@@ -222,13 +222,13 @@ export function useWorkspace(persistentUserId: string | null) {
         palette: requirements.palette ?? inferred.palette,
         testimonials: requirements.testimonials ?? inferred.testimonials,
         premiumHero: inferred.premiumHero,
-        menuBar: requirements.menuBar ?? inferred.menuBar,
+        navigation: requirements.navigation ?? inferred.navigation,
       }
       : {
         ...activeVersion.options,
         ...(requirements.palette ? { palette: requirements.palette } : {}),
         ...(requirements.testimonials !== null ? { testimonials: requirements.testimonials } : {}),
-        ...(requirements.menuBar !== null ? { menuBar: requirements.menuBar } : {}),
+        ...(requirements.navigation !== null ? { navigation: requirements.navigation } : {}),
       };
     const messages = [...activeProject.messages, { id: newId(), role: 'user' as const, text }];
     updateProject(activeProject.id, (project) => ({ ...project, messages }));
@@ -274,6 +274,9 @@ export function useWorkspace(persistentUserId: string | null) {
         if (event.event === 'retry' && typeof event.data.reason === 'string') {
           setGeneration((current) => ({ ...current, recoveryStatus: `Trying the next provider after ${event.data.reason}.` }));
         }
+        if (event.event === 'correction' && typeof event.data.path === 'string' && typeof event.data.code === 'string' && typeof event.data.attempt === 'number') {
+          setGeneration((current) => ({ ...current, recoveryStatus: `Automatically correcting ${event.data.path} after ${event.data.code} (attempt ${event.data.attempt}).` }));
+        }
         if (event.event === 'delta' && typeof event.data.characters === 'number') {
           const count = event.data.characters;
           setGeneration((current) => ({ ...current, streamedCharacters: current.streamedCharacters + count }));
@@ -312,25 +315,29 @@ export function useWorkspace(persistentUserId: string | null) {
         if (event.event === 'complete') completionData = event.data;
       });
 
-      if (completionData?.saved === false && previewVersion) {
+      if (completionData?.saved === false) {
         const saveState = completionData.saveState === 'retrying' ? 'retrying' : 'failed';
-        const messageText = saveState === 'retrying'
-          ? 'The website preview is ready. Saving to your account is retrying in the background.'
-          : 'The website preview is ready in this browser session, but automatic saving could not be queued.';
-        const finalMessages = [...messages, { id: newId(), role: 'assistant' as const, text: messageText }];
+        const messageText = typeof completionData.warning === 'string'
+          ? completionData.warning
+          : saveState === 'retrying'
+            ? 'Files generated, but saving failed. Your previous saved version remains active while D-GUY retries.'
+            : 'Files generated, but saving failed. Your previous saved version remains active.';
+        const correlationId = typeof completionData.correlationId === 'string' ? completionData.correlationId : jobId;
+        const correlatedMessage = `${messageText} Reference: ${correlationId}`;
+        const finalMessages = [...messages, { id: newId(), role: 'assistant' as const, text: correlatedMessage }];
         updateProject(activeProject.id, (project) => ({ ...project, messages: finalMessages }));
         void backendApi.updateProject({ id: activeProject.id, name: activeProject.name, messages: finalMessages }).catch(() => {
-          setGeneration((current) => ({ ...current, saveWarning: 'The preview is ready, but the chat history could not be saved.' }));
+          setGeneration((current) => ({ ...current, saveWarning: 'Files were generated, but chat history could not be saved.' }));
         });
         controllerRef.current = null;
         setGeneration((current) => ({
           ...current,
-          status: 'complete',
-          stageIndex: current.stages.length,
+          status: 'error',
           finishedAt: Date.now(),
           streamedFiles: {},
+          error: correlatedMessage,
           saveState,
-          saveWarning: saveState === 'retrying' ? 'Saving the generated version is retrying in the background.' : 'The generated version could not be queued for saving.',
+          saveWarning: correlatedMessage,
         }));
         if (saveState === 'retrying' && jobId) watchProjectSave(activeProject.id, jobId);
         return previewVersion;

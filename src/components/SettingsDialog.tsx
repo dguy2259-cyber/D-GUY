@@ -20,7 +20,7 @@ export function SettingsDialog({ onResetWorkspace, onClose, onLogout }: Settings
     return () => { active = false; };
   }, []);
   const rows = [
-    { label: 'AI Engine', value: provider, note: 'Website generation tries Gemini first, then Groq, configured OpenRouter, and the existing Hugging Face fallback. Provider keys remain server-side.' },
+    { label: 'AI Engine', value: provider, note: 'Website generation follows the configured provider order with server-side credentials. Provider keys remain private to the API server.' },
     { label: 'Preview Sandbox', value: 'Isolated', note: 'Static HTML uses a network-restricted iframe. Supported React, Vite, and Next.js projects run in a browser WebContainer, not on the D-GUY server.' },
     { label: 'API + Database', value: apiStatus, note: 'Project files, versions, and account state are stored in Supabase PostgreSQL.' },
   ];

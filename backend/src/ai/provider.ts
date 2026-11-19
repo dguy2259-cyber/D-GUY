@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { Script } from 'node:vm';
 import { projectFilesSchema } from '../security/files.js';
 import type { HuggingFaceProviderConfig } from './huggingface.js';
+import { runAutomaticCorrectionLoop } from '../recovery/automaticCorrection.js';
 
 const responseSchema = z.object({
   summary: z.string().min(1).max(2000),
@@ -32,7 +33,7 @@ const SYSTEM_PROMPT = [
   'For a file-scoped task, return exactly the requested file or files and do not add other project files. The response must still follow the required JSON object schema.',
   'Return valid JSON only, with exactly summary, files, and warnings. files is an array of non-empty {path, content} objects. Never return blank paths or content, markdown fences, commentary, or reasoning in the JSON result.',
   'Generate an application-appropriate project structure. For React or Next.js requests include complete source files, package.json, and necessary frontend configuration. Use the framework entry point as index.html where required; do not duplicate the whole website in a second static scaffold. For whole-project static requests, build the requested site in index.html. For requested Node.js backends include source files and package.json, but never execute them on the D-GUY server.',
-  'Create a polished, usable result with a clear visual hierarchy, responsive mobile layout, working in-page navigation when requested, and functional interactions. Avoid placeholder copy, unnecessary dependencies, and oversized output. For a whole-project static website request, return exactly the essential files index.html, styles.css, and app.js unless the prompt explicitly requests one self-contained index.html or needs more files. Link styles.css from index.html and load app.js with defer. Keep each file complete and concise. For React/Next.js, include the required CSS and JavaScript/TypeScript application source alongside index.html.',
+  'Create a polished, usable result with a clear visual hierarchy, responsive mobile layout, functional interactions, and working in-page navigation when requested. Avoid placeholder copy, unnecessary dependencies, and oversized output. For a whole-project static website request, return exactly the essential files index.html, styles.css, and app.js unless the prompt explicitly needs more. Link styles.css from index.html and load app.js with defer. Keep each file complete and concise. For React/Next.js, include the required CSS and JavaScript/TypeScript application source alongside index.html.',
   'The index.html preview must not make fetch/XHR/WebSocket requests and must not depend on a backend server. Use Tailwind only when the user explicitly requests it.',
   'Preserve existing project files and behavior during revisions unless the user asks to change them. Make revision changes in the current file structure instead of replacing the whole project.',
   'Do not claim that code was executed. Do not include secrets, credentials, or executable server-side commands.',
@@ -65,15 +66,7 @@ export interface WebsiteProviderConfig extends FallbackConfig {
   providerOrder?: HttpProvider[];
   singleRequestMode?: boolean;
 }
-export interface GenerationInput {
-  prompt: string;
-  currentFiles: unknown;
-  mode: 'create' | 'revise';
-  maxOutputTokens?: number;
-  requirePreview?: boolean;
-  expectedFilePath?: string;
-  requireNavigation?: boolean;
-}
+export interface GenerationInput { prompt: string; currentFiles: unknown; mode: 'create' | 'revise'; maxOutputTokens?: number; requirePreview?: boolean; expectedFilePath?: string; navigation?: boolean }
 export type GenerationProvider = 'groq' | 'gemini' | 'openrouter' | 'huggingface';
 export type GenerationEvent =
   | { type: 'provider'; provider: GenerationProvider }
@@ -82,24 +75,48 @@ export type GenerationEvent =
   | { type: 'file_delta'; provider: GenerationProvider; path: string; text: string }
   | { type: 'file_started'; path: string }
   | { type: 'file'; provider: GenerationProvider; path: string }
+  | { type: 'correction'; provider?: GenerationProvider; path: string; code: string; attempt: number; correctionNumber: number }
   | { type: 'retry'; provider: GenerationProvider; reason: string };
 export type GeminiDiagnosticEvent = {
-  stage: 'request_created' | 'request_started' | 'response_headers' | 'first_byte' | 'response_complete' | 'provider_error' | 'request_failed' | 'timeout';
+  stage: 'request_created' | 'request_started' | 'response_headers' | 'first_byte' | 'response_complete' | 'provider_error' | 'request_failed' | 'timeout' | 'format_fallback';
   provider?: GenerationProvider;
   model?: string;
   attempt?: number;
   elapsedMs: number;
   status?: number;
+  providerRequestId?: string;
+  finishReason?: GroqResponseDiagnostics['finishReason'];
   category?: ProviderFailureCategory;
   providerCode?: string;
+  providerField?: string;
+  providerMessage?: string;
   responseBytes?: number;
   retryAfterMs?: number;
+  rateLimit?: { remainingRequests?: number; limitRequests?: number; resetRequestsMs?: number; remainingTokens?: number; limitTokens?: number; resetTokensMs?: number };
   inputTokens?: number;
   outputTokens?: number;
   timeoutType?: 'first_byte_timeout' | 'stream_idle_timeout' | 'total_deadline_exceeded';
 };
 
 export type ProviderFailureCategory = 'authentication_rejected' | 'invalid_model' | 'invalid_request' | 'rate_limited' | 'provider_unavailable' | 'network_error' | 'timeout' | 'invalid_output' | 'configuration_error' | 'credits_exhausted' | 'safety_guard_blocked' | 'cancelled';
+
+function safeProviderMessage(category: ProviderFailureCategory): string {
+  const messages: Record<ProviderFailureCategory, string> = {
+    authentication_rejected: 'Provider rejected the configured credential.',
+    invalid_model: 'Configured model is unavailable to this API key.',
+    invalid_request: 'Provider rejected the generation request.',
+    rate_limited: 'Provider rate limit was reached.',
+    provider_unavailable: 'Provider service is temporarily unavailable.',
+    network_error: 'Provider could not be reached.',
+    timeout: 'Provider request timed out.',
+    invalid_output: 'Provider output did not match the required website format.',
+    configuration_error: 'Provider configuration is incomplete.',
+    credits_exhausted: 'Provider account has no remaining credits.',
+    safety_guard_blocked: 'Provider safety policy blocked the request.',
+    cancelled: 'Provider request was cancelled.',
+  };
+  return messages[category];
+}
 export type GroqResponseDiagnostics = {
   choiceCount: number;
   messagePresent: boolean;
@@ -278,7 +295,8 @@ function parseOutput(value: unknown, usage: { input: number; output: number }, r
     const providerField = path && /^[a-zA-Z0-9_.-]{1,80}$/.test(path) ? path : undefined;
     throw new GenerationOutputFailure('schema_validation_failed', undefined, providerField);
   }
-  if (expectedFilePath && (parsed.files.length !== 1 || parsed.files[0]?.path !== expectedFilePath || !parsed.files[0]?.content.trim())) {
+  const requiresNonEmptyContent = expectedFilePath === 'index.html' || (expectedFilePath !== 'styles.css' && expectedFilePath !== 'app.js');
+  if (expectedFilePath && (parsed.files.length !== 1 || parsed.files[0]?.path !== expectedFilePath || (requiresNonEmptyContent && !parsed.files[0]?.content.trim()))) {
     throw new GenerationOutputFailure('missing_expected_file');
   }
   if (requirePreview && !parsed.files.some((file) => file.path.toLowerCase() === 'index.html' && file.content.trim().length > 0)) {
@@ -315,6 +333,7 @@ function providerErrorCode(payload: unknown): string | undefined {
   const safeCodes = new Set([
     'invalid_api_key', 'model_not_found', 'model_decommissioned', 'rate_limit_exceeded',
     'insufficient_quota', 'invalid_request_error', 'resource_exhausted', 'not_found',
+    'json_validate_failed',
     'unauthenticated', 'permission_denied', 'deadline_exceeded', 'unavailable',
     'internal_error', 'invalid_argument', 'unsupported_value', 'context_length_exceeded',
   ]);
@@ -397,12 +416,14 @@ async function postWithRetry(
       response = await fetcher(url, init(deadline.signal));
     } catch (error) {
       const failure = classifyThrownFailure(provider, error, parentSignal, deadline);
-      onDiagnostic?.({ stage: 'request_failed', provider, attempt: attempt + 1, elapsedMs: deadline.elapsedMs, category: failure.info.category, ...(failure.info.providerCode ? { providerCode: failure.info.providerCode } : {}), ...(failure.info.responseBytes !== undefined ? { responseBytes: failure.info.responseBytes } : {}) });
+      onDiagnostic?.({ stage: 'request_failed', provider, attempt: attempt + 1, elapsedMs: deadline.elapsedMs, category: failure.info.category, ...(failure.info.providerCode ? { providerCode: failure.info.providerCode } : {}), providerMessage: safeProviderMessage(failure.info.category), ...(failure.info.responseBytes !== undefined ? { responseBytes: failure.info.responseBytes } : {}) });
       if (!failure.info.recoverable || attempt === 1 || deadline.signal.aborted) throw failure;
       await waitForRetry(250 * 2 ** attempt, deadline.signal);
       continue;
     }
-    onDiagnostic?.({ stage: 'response_headers', provider, attempt: attempt + 1, elapsedMs: deadline.elapsedMs, status: response.status });
+    const rateLimit = provider === 'groq' ? groqRateLimitHeaders(response.headers) : undefined;
+    const providerRequestId = provider === 'groq' ? safeProviderRequestId(response.headers) : undefined;
+    onDiagnostic?.({ stage: 'response_headers', provider, attempt: attempt + 1, elapsedMs: deadline.elapsedMs, status: response.status, ...(rateLimit ? { rateLimit } : {}), ...(providerRequestId ? { providerRequestId } : {}) });
     if (response.ok) { providerCooldowns.delete(provider); return response; }
     const body = await readResponseText(response, deadline, 64_000);
     let payload: unknown;
@@ -413,6 +434,8 @@ async function postWithRetry(
       stage: 'provider_error', provider, attempt: attempt + 1, elapsedMs: deadline.elapsedMs,
       status: response.status, category: failure.info.category,
       ...(failure.info.providerCode ? { providerCode: failure.info.providerCode } : {}),
+      ...(failure.info.providerField ? { providerField: failure.info.providerField } : {}),
+      providerMessage: safeProviderMessage(failure.info.category),
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
       responseBytes: deadline.bytesReceived,
     });
@@ -427,6 +450,28 @@ async function postWithRetry(
     await waitForRetry(delayMs, deadline.signal);
   }
   throw new ProviderFailure({ provider, category: 'provider_unavailable', recoverable: true });
+}
+
+function safeProviderRequestId(headers: Headers): string | undefined {
+  const value = headers.get('x-groq-id') ?? headers.get('x-request-id') ?? headers.get('request-id');
+  return value && /^[\w.-]{1,120}$/.test(value) ? value : undefined;
+}
+
+function groqRateLimitHeaders(headers: Headers): NonNullable<GeminiDiagnosticEvent['rateLimit']> | undefined {
+  const number = (name: string) => { const value = headers.get(name); return value !== null && /^\d+$/.test(value) ? Number(value) : undefined; };
+  const duration = (value: string | null) => {
+    if (!value) return undefined;
+    const match = /(?:(\d+(?:\.\d+)?)h)?\s*(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+(?:\.\d+)?)s)?/i.exec(value);
+    if (!match || !match[0]) return undefined;
+    return Math.ceil(((Number(match[1] ?? 0) * 3600) + (Number(match[2] ?? 0) * 60) + Number(match[3] ?? 0)) * 1000);
+  };
+  const result = {
+    remainingRequests: number('x-ratelimit-remaining-requests'), limitRequests: number('x-ratelimit-limit-requests'),
+    resetRequestsMs: duration(headers.get('x-ratelimit-reset-requests')),
+    remainingTokens: number('x-ratelimit-remaining-tokens'), limitTokens: number('x-ratelimit-limit-tokens'),
+    resetTokensMs: duration(headers.get('x-ratelimit-reset-tokens')),
+  };
+  return Object.values(result).some((value) => value !== undefined) ? result : undefined;
 }
 
 async function readResponseText(response: Response, deadline: ProviderRequestDeadline, maxBytes: number): Promise<string> {
@@ -609,7 +654,7 @@ export async function generateWithGroq(
   let responseStatus: number | undefined;
   report({ stage: 'request_created', elapsedMs: 0 });
   try {
-    const response = await postWithRetry('groq', `${base.toString().replace(/\/$/, '')}/chat/completions`, (requestSignal) => ({
+    const request = (requestSignal: AbortSignal, useJsonObjectMode: boolean): RequestInit => ({
       method: 'POST', signal: requestSignal,
       headers: { authorization: `Bearer ${config.apiKey}`, 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({
@@ -620,14 +665,29 @@ export async function generateWithGroq(
         max_completion_tokens: input.expectedFilePath && input.expectedFilePath !== 'index.html' ? Math.min(2_048, outputTokenLimit(input)) : outputTokenLimit(input),
         ...(config.model.toLowerCase().startsWith('qwen/') ? { reasoning_effort: 'none' } : {}),
         ...(config.model.toLowerCase().startsWith('qwen/') ? { reasoning_format: 'hidden' } : {}),
-        response_format: { type: 'json_schema', json_schema: { name: 'dguy_project', strict: true, schema: OUTPUT_JSON_SCHEMA } },
+        response_format: useJsonObjectMode
+          ? { type: 'json_object' }
+          : { type: 'json_schema', json_schema: { name: 'dguy_project', strict: true, schema: OUTPUT_JSON_SCHEMA } },
         stream: false,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: JSON.stringify(input) },
         ],
       }),
-    }), signal, deadline, fetcher, report);
+    });
+    const url = `${base.toString().replace(/\/$/, '')}/chat/completions`;
+    let response: Response;
+    try {
+      response = await postWithRetry('groq', url, (requestSignal) => request(requestSignal, false), signal, deadline, fetcher, report);
+    } catch (error) {
+      if (!(error instanceof ProviderFailure) || error.info.providerCode !== 'json_validate_failed' || signal.aborted) throw error;
+      report({
+        stage: 'format_fallback', elapsedMs: deadline.elapsedMs,
+        category: 'invalid_request', providerCode: 'json_validate_failed',
+        providerMessage: 'Groq strict JSON output was rejected; retrying once in JSON object mode.',
+      });
+      response = await postWithRetry('groq', url, (requestSignal) => request(requestSignal, true), signal, deadline, fetcher, report);
+    }
     responseStatus = response.status;
     const body = await readResponseText(response, deadline, 1_500_000);
     if (!body.trim()) throw new GenerationOutputFailure('empty_provider_response');
@@ -648,6 +708,7 @@ export async function generateWithGroq(
       elapsedMs: deadline.elapsedMs,
       status: response.status,
       responseBytes: deadline.bytesReceived,
+      finishReason: diagnostics.finishReason,
       inputTokens: usage.input,
       outputTokens: usage.output,
     });
@@ -661,6 +722,9 @@ export async function generateWithGroq(
       ...(responseStatus !== undefined ? { status: responseStatus } : {}),
       category: failure.info.category,
       ...(failure.info.providerCode ? { providerCode: failure.info.providerCode } : {}),
+      ...(failure.info.providerField ? { providerField: failure.info.providerField } : {}),
+      ...(failure.info.diagnostics?.finishReason ? { finishReason: failure.info.diagnostics.finishReason } : {}),
+      providerMessage: safeProviderMessage(failure.info.category),
       responseBytes: deadline.bytesReceived,
     });
     throw failure;
@@ -1011,20 +1075,10 @@ export async function generateWebsiteWithFallback(
 ): Promise<GenerationOutput> {
   const failures: ProviderFailureInfo[] = [];
   let fileStreamer = new JsonProjectFileStreamer();
-  const salvagedFiles = new Map<string, { path: string; content: string }>();
-  let salvageProvider: GenerationProvider | undefined;
   let activeProvider: GenerationProvider | undefined;
-  const captureCompleteFiles = () => {
-    const complete = fileStreamer.completeFiles;
-    for (const file of complete) {
-      salvagedFiles.set(file.path, file);
-      salvageProvider = activeProvider ?? salvageProvider;
-    }
-  };
   const forwardEvent = (event: GenerationEvent) => {
     if (event.type === 'provider') {
       if (activeProvider && activeProvider !== event.provider && fileStreamer) {
-        captureCompleteFiles();
         for (const path of fileStreamer.streamedPaths) onEvent?.({ type: 'file_started', path });
         fileStreamer = new JsonProjectFileStreamer();
       }
@@ -1082,7 +1136,6 @@ export async function generateWebsiteWithFallback(
       const prior = failures.map((failure) => `${failure.provider} failed with ${failure.category}${failure.status ? ` (HTTP ${failure.status})` : ''}${failure.providerCode ? ` [${failure.providerCode}]` : ''}`).join('; ');
       return { ...output, provider: candidate.provider, warnings: [...output.warnings, prior ? `${prior}; ${candidate.provider} generated this version.` : `Generated by ${candidate.provider}.`] };
     } catch (error) {
-      captureCompleteFiles();
       if (signal.aborted) throw signal.reason ?? new Error('Generation cancelled');
       if (generationSignal.aborted) {
         failures.push(new ProviderFailure({ provider: candidate.provider, category: 'timeout', providerCode: 'generation_deadline_exceeded', recoverable: false }).info);
@@ -1103,7 +1156,6 @@ export async function generateWebsiteWithFallback(
       const prior = failures.map((failure) => `${failure.provider} failed with ${failure.category}${failure.status ? ` (HTTP ${failure.status})` : ''}${failure.providerCode ? ` [${failure.providerCode}]` : ''}`).join('; ');
       return { ...output, provider: 'huggingface', warnings: [...output.warnings, `${prior}; Hugging Face Featherless generated this version.`] };
     } catch (error) {
-      captureCompleteFiles();
       if (signal.aborted) throw signal.reason ?? new Error('Generation cancelled');
       if (generationSignal.aborted) failures.push(new ProviderFailure({ provider: 'huggingface', category: 'timeout', providerCode: 'generation_deadline_exceeded', recoverable: false }).info);
       else {
@@ -1112,19 +1164,8 @@ export async function generateWebsiteWithFallback(
       }
     }
   }
-  captureCompleteFiles();
-  const salvaged = [...salvagedFiles.values()];
-  if (salvaged.length && (input.expectedFilePath
-    ? salvaged.some((file) => file.path === input.expectedFilePath)
-    : salvaged.some((file) => file.path.toLowerCase() === 'index.html' && file.content.trim()))) {
-    const reasons = failures.map((failure) => `${failure.provider}: ${failure.category}${failure.status ? ` HTTP ${failure.status}` : ''}${failure.providerCode ? ` (${failure.providerCode})` : ''}`);
-    const partial = parseOutput({
-      summary: 'A preview was assembled from complete files salvaged from an incomplete provider response.',
-      files: salvaged,
-      warnings: [`Provider output was incomplete; preserved complete files from ${salvageProvider ?? 'the provider'}.`, ...reasons],
-    }, { input: 0, output: 0 }, requiresPreview(input), input.expectedFilePath);
-    return { ...partial, provider: salvageProvider };
-  }
+  // Complete streamed files from an interrupted response remain diagnostics only;
+  // they must never be promoted to a successful, persistable generation.
   throw new GenerationFailure(failures);
 }
 
@@ -1134,8 +1175,8 @@ function staticWebsitePrompt(prompt: string): boolean {
 
 const STATIC_FILE_INSTRUCTIONS: Record<'index.html' | 'styles.css' | 'app.js', string> = {
   'index.html': 'Create only index.html. Use semantic vanilla HTML, accessible controls and stable IDs/classes for requested sections and interactions. Include <meta name="viewport" content="width=device-width, initial-scale=1">. Link exactly ./styles.css and ./app.js (defer). Close every element and finish the complete document. Do not inline CSS or JavaScript. Do not use React, a bundler, Tailwind, remote fonts, external scripts, remote images, or network requests unless explicitly requested; use CSS decoration or inline SVG instead.',
-  'styles.css': 'Create only styles.css. Style the provided index.html into a polished site that remains usable at 1440px desktop, 768px tablet, and 390px mobile widths. Include complete @media (max-width: 1024px) and @media (max-width: 768px) rules (plus compact breakpoint if useful), mobile-menu selectors matching the HTML when navigation is present, hero spacing that stacks cleanly, min-width:0 on grid/flex children, global box-sizing:border-box, responsive images (max-width:100%; height:auto), cards/headings/buttons that wrap and fit, no horizontal overflow, visible focus states, reduced-motion support. Close every rule and output a complete stylesheet. Do not include HTML or JavaScript.',
-  'app.js': 'Create only app.js. Implement the requested client-side interactions using vanilla browser JavaScript and the IDs/classes present in index.html. If a mobile menu is present, toggle it, update aria-expanded, close after link selection, and support Escape. Guard optional elements before using them. Do not include HTML, CSS, frameworks, fetch/XHR/WebSocket calls, or server code.',
+  'styles.css': 'Create only styles.css. Style the provided index.html into a polished site that remains usable at 1440px desktop, 768px tablet, and 390px mobile widths. Include complete @media (max-width: 1024px) and @media (max-width: 768px) rules (plus compact breakpoint if useful), hero spacing that stacks cleanly, min-width:0 on grid/flex children, global box-sizing:border-box, responsive images (max-width:100%; height:auto), cards/headings/buttons that wrap and fit, no horizontal overflow, visible focus states, reduced-motion support. Close every rule and output a complete stylesheet. Do not include HTML or JavaScript.',
+  'app.js': 'Create only app.js. Implement the requested client-side interactions using vanilla browser JavaScript and the IDs/classes present in index.html. Guard optional elements before using them. Do not include HTML, CSS, frameworks, fetch/XHR/WebSocket calls, or server code.',
 };
 
 function splitInlineAssets(html: string): Array<{ path: string; content: string }> {
@@ -1177,6 +1218,33 @@ function splitInlineAssets(html: string): Array<{ path: string; content: string 
   ];
 }
 
+export function normalizeStaticWebsiteFiles(files: Array<{ path: string; content: string }>): Array<{ path: string; content: string }> {
+  const sourceHtml = files.find((file) => file.path === 'index.html')?.content ?? '';
+  const split = splitInlineAssets(sourceHtml);
+  let html = split[0]!.content;
+  const css = [files.find((file) => file.path === 'styles.css')?.content ?? '', split.find((file) => file.path === 'styles.css')?.content ?? ''].filter((content) => content.trim()).join('\n\n');
+  const js = [files.find((file) => file.path === 'app.js')?.content ?? '', split.find((file) => file.path === 'app.js')?.content ?? ''].filter((content) => content.trim()).join('\n;\n');
+  const hasLocalStylesheet = /<link\b(?=[^>]*\bhref\s*=\s*["'](?:\.\/)?styles\.css["'])[^>]*>/i.test(html);
+  const hasLocalScript = /<script\b(?=[^>]*\bsrc\s*=\s*["'](?:\.\/)?app\.js["'])[^>]*>/i.test(html);
+  if (css && !hasLocalStylesheet) {
+    const link = '<link rel="stylesheet" href="./styles.css">';
+    html = /<\/head\s*>/i.test(html) ? html.replace(/<\/head\s*>/i, `${link}\n</head>`) : html.replace(/<html\b[^>]*>/i, (opening) => `${opening}<head>${link}</head>`);
+  } else if (!css) {
+    html = html.replace(/<link\b(?=[^>]*\bhref\s*=\s*["'](?:\.\/)?styles\.css["'])[^>]*>/gi, '');
+  }
+  if (js && !hasLocalScript) {
+    const script = '<script defer src="./app.js"></script>';
+    html = /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, `${script}\n</body>`) : `${html}\n${script}`;
+  } else if (!js) {
+    html = html.replace(/<script\b(?=[^>]*\bsrc\s*=\s*["'](?:\.\/)?app\.js["'])[^>]*>\s*<\/script\s*>/gi, '');
+  }
+  return [
+    { path: 'index.html', content: html },
+    ...(css ? [{ path: 'styles.css', content: css }] : []),
+    ...(js ? [{ path: 'app.js', content: js }] : []),
+  ];
+}
+
 async function generateSingleRequestWebsite(
   input: GenerationInput,
   config: WebsiteProviderConfig,
@@ -1185,12 +1253,9 @@ async function generateSingleRequestWebsite(
   onEvent?: (event: GenerationEvent) => void,
   onGeminiDiagnostic?: (event: GeminiDiagnosticEvent) => void,
 ): Promise<GenerationOutput> {
-  const navigationInstruction = input.requireNavigation === false
-    ? 'Do not include a top navigation/menu bar.'
-    : 'Include an accessible responsive top navigation/menu bar with a mobile menu toggle.';
   const prompt = [
     input.prompt,
-    `Build exactly one self-contained, single-page website as one complete index.html file. Put all CSS in inline <style> elements and all browser JavaScript in inline <script> elements. ${navigationInstruction} Do not return extra pages or files, external stylesheets, scripts, frameworks, build tools, or server code. Return a complete HTML document suitable for an isolated browser preview.`,
+    `Build exactly one self-contained, single-page website as one complete index.html file. Put all CSS in inline <style> elements and all browser JavaScript in inline <script> elements. ${input.navigation === false ? 'Do not include a top navigation bar or menu.' : 'Include an accessible responsive navigation menu.'} Do not return extra pages or files, external stylesheets, scripts, frameworks, build tools, or server code. Return a complete HTML document suitable for an isolated browser preview.`,
   ].join('\n\n');
   const generated = await generateWebsiteWithFallback({
     ...input,
@@ -1207,13 +1272,7 @@ async function generateSingleRequestWebsite(
   const warnings = [...generated.warnings];
   if (!files.some((file) => file.path === 'styles.css')) warnings.push('The single HTML response contained no inline stylesheet.');
   if (!files.some((file) => file.path === 'app.js')) warnings.push('The single HTML response contained no inline application script.');
-  if (files.length === 3) {
-    try { validateVanillaProject(files, generated.provider ?? 'groq', { requireNavigation: input.requireNavigation !== false }); }
-    catch (error) {
-      if (!(error instanceof ProviderFailure)) throw error;
-      warnings.push(`The single-request website needs a follow-up validation pass (${error.info.providerCode ?? error.info.category}).`);
-    }
-  }
+  validateGeneratedStaticWebsite(files, generated.provider ?? 'groq', { singleRequestMode: true, navigation: input.navigation });
   const provider = generated.provider ?? 'groq';
   for (const file of files) {
     onEvent?.({ type: 'file_started', path: file.path });
@@ -1476,10 +1535,14 @@ async function generateStaticFile(
       `Original website request: ${input.prompt}`,
       `Requested output file: ${path}`,
       STATIC_FILE_INSTRUCTIONS[path],
-      input.requireNavigation === false
-        ? 'Do not add a top navigation or menu bar. Avoid menu-toggle controls.'
-        : 'Include an accessible top navigation and responsive mobile menu with a working toggle.',
-      'Return a D-GUY JSON response with summary, files, and warnings. The files array must contain exactly one object, with this exact path and complete non-empty content.',
+      path === 'index.html' && input.navigation !== false
+        ? 'Include an accessible responsive nav button with aria-controls and aria-expanded pointing to an actual mobile menu container, with navigation links.'
+        : path === 'index.html' ? 'Do not include a top navigation bar or menu.'
+          : path === 'styles.css' && input.navigation !== false ? 'Add styles for the real collapsible mobile menu selectors in the HTML.'
+            : path === 'styles.css' ? 'No top navigation or menu is requested; do not add menu-specific selectors.'
+              : path === 'app.js' && input.navigation !== false ? 'Implement the menu toggle, aria-expanded updates, close-on-link, and Escape-key behavior.'
+                : 'No top navigation or menu is requested; do not add menu handlers.',
+      `Return a D-GUY JSON response with summary, files, and warnings. The files array must contain exactly one object with this exact path and complete content.${path === 'styles.css' || path === 'app.js' ? ' Empty content is allowed only when that asset is genuinely unnecessary.' : ' HTML content must be non-empty.'}`,
       repairInstruction ? `Repair requirement: ${repairInstruction}` : '',
       'Keep the response for this file concise and complete. Do not use markdown fences.',
     ].filter(Boolean).join('\n\n'),
@@ -1487,7 +1550,6 @@ async function generateStaticFile(
     mode: 'create',
     requirePreview: false,
     maxOutputTokens,
-    requireNavigation: input.requireNavigation,
     expectedFilePath: path,
   });
   const remaining = () => Math.max(0, (config.totalTimeoutMs ?? 360_000) - (Date.now() - startedAt));
@@ -1538,8 +1600,8 @@ async function generateStaticFile(
     output.warnings.push(`Regenerated ${path} once after provider output was truncated.`);
   }
   const files = output.files;
-  if (files.length !== 1 || files[0]?.path !== path || !files[0]?.content.trim()) throw new GenerationFailure([{ provider: output.provider ?? preferredProvider ?? 'gemini', category: 'invalid_output', providerCode: 'missing_expected_file', recoverable: false }]);
-  if (output.provider) onEvent?.({ type: 'file', provider: output.provider, path });
+  if (files.length !== 1 || files[0]?.path !== path || (path === 'index.html' && !files[0]?.content.trim())) throw new GenerationFailure([{ provider: output.provider ?? preferredProvider ?? 'gemini', category: 'invalid_output', providerCode: 'missing_expected_file', recoverable: false }]);
+  if (output.provider && files[0]?.content.trim()) onEvent?.({ type: 'file', provider: output.provider, path });
   return output;
 }
 
@@ -1580,7 +1642,7 @@ export async function generateVanillaWebsiteWithFallback(
   ]);
   const css = cssResult.status === 'fulfilled' ? cssResult.value : undefined;
   const js = jsResult.status === 'fulfilled' ? jsResult.value : undefined;
-  const files = [htmlFile, ...(css ? [css.files[0]!] : []), ...(js ? [js.files[0]!] : [])];
+  const files = normalizeStaticWebsiteFiles([htmlFile, ...(css ? [css.files[0]!] : []), ...(js ? [js.files[0]!] : [])]);
   const providerByPath: Record<'index.html' | 'styles.css' | 'app.js', GenerationProvider | undefined> = {
     'index.html': html.provider,
     'styles.css': css?.provider,
@@ -1595,42 +1657,46 @@ export async function generateVanillaWebsiteWithFallback(
       : deadline.aborted
         ? 'The website generation deadline was reached.'
         : 'The provider could not complete this file.';
-  if (!css) warnings.push(`styles.css is missing; the generated HTML preview is still available. ${failureMessage((cssResult as PromiseRejectedResult).reason)}`);
-  if (!js) warnings.push(`app.js is missing; the generated HTML preview is still available. ${failureMessage((jsResult as PromiseRejectedResult).reason)}`);
-  const repairedPaths = new Set<string>();
-  let repairs = 0;
-  while (files.length === 3) {
-    try {
-      validateVanillaProject(files, js?.provider ?? css?.provider ?? html.provider ?? 'gemini', { requireNavigation: input.requireNavigation !== false });
-      break;
-    } catch (error) {
-      if (!(error instanceof ProviderFailure) || repairs >= 2) throw error;
+  if (!files.some((file) => file.path === 'styles.css')) warnings.push(`No separate stylesheet was needed or generated.${css ? '' : ` ${failureMessage((cssResult as PromiseRejectedResult).reason)}`}`.trim());
+  if (!files.some((file) => file.path === 'app.js')) warnings.push(`No separate JavaScript file was needed or generated.${js ? '' : ` ${failureMessage((jsResult as PromiseRejectedResult).reason)}`}`.trim());
+  await runAutomaticCorrectionLoop({
+    signal: deadline,
+    maxCorrections: 4,
+    maxCorrectionsPerFile: 2,
+    validate: () => {
+      if (files.length === 3) validateVanillaProject(files, js?.provider ?? css?.provider ?? html.provider ?? 'gemini', { navigation: input.navigation });
+      else validateGeneratedStaticWebsite(files, providers[0] ?? 'gemini', { singleRequestMode: false, navigation: input.navigation });
+    },
+    identify: (error) => {
+      if (!(error instanceof ProviderFailure) || error.info.category !== 'invalid_output') return undefined;
       const code = error.info.providerCode;
-      const path: 'index.html' | 'styles.css' | 'app.js' | undefined = code === 'static_preview_assets_not_linked' || code === 'viewport_meta_missing' || code === 'responsive_navigation_missing' || code === 'responsive_navigation_ids_invalid'
+      const filePath: 'index.html' | 'styles.css' | 'app.js' | undefined = code === 'incomplete_html_document' || code === 'static_preview_assets_not_linked' || code === 'viewport_meta_missing' || code === 'responsive_navigation_missing' || code === 'responsive_navigation_ids_invalid'
         ? 'index.html'
-        : code === 'stylesheet_incomplete' || code === 'responsive_breakpoints_missing' || code === 'responsive_menu_styles_missing'
+        : code === 'stylesheet_incomplete' || code === 'responsive_breakpoints_missing' || code === 'responsive_menu_styles_missing' || code === 'responsive_content_constraints_missing'
           ? 'styles.css'
-          : code === 'responsive_content_constraints_missing'
-            ? 'styles.css'
-            : code === 'responsive_navigation_behavior_missing' || code === 'javascript_syntax_error'
+          : code === 'responsive_navigation_behavior_missing' || code === 'javascript_syntax_error'
             ? 'app.js' : undefined;
-      if (!path || repairedPaths.has(path)) throw error;
+      return filePath && code ? { filePath, code } : undefined;
+    },
+    onCorrection: ({ filePath, code }, attempt, correctionNumber) => onEvent?.({
+      type: 'correction', path: filePath, code, attempt, correctionNumber, provider: providerByPath[filePath as keyof typeof providerByPath],
+    }),
+    correct: async ({ filePath, code }, attempt, correctionNumber) => {
+      const path = filePath as 'index.html' | 'styles.css' | 'app.js';
       const priorFile = files.find((file) => file.path === path);
-      if (!priorFile) throw error;
+      if (!priorFile) throw new ProviderFailure({ provider: providers[0] ?? 'groq', category: 'invalid_output', providerCode: 'missing_expected_file', recoverable: false });
       const repairContext = files.filter((file) => file.path === path || file.path === 'index.html');
       const priorProvider = providerByPath[path];
       const preferredHttpProvider: HttpProvider | undefined = priorProvider === 'groq' || priorProvider === 'gemini' || priorProvider === 'openrouter' ? priorProvider : undefined;
-      const repair = await generateStaticFile(path, input, repairContext, config, deadline, fetcher, onEvent, onGeminiDiagnostic, preferredHttpProvider, `The generated ${path} failed the ${code} validation. Replace it with a complete, valid file satisfying every responsive and accessibility requirement. Do not truncate it.`);
-      const repairedFile = repair.files[0]!;
-      files.splice(files.findIndex((file) => file.path === path), 1, repairedFile);
-      repairedPaths.add(path);
-      repairs += 1;
+      const instruction = `Automatic correction ${attempt} for ${path}: the previous generated file failed ${code} validation. Fix the diagnosed issue while preserving the requested website, visual design, content, and working behavior. Return a complete, valid file and do not truncate it.`;
+      const repair = await generateStaticFile(path, input, repairContext, config, deadline, fetcher, onEvent, onGeminiDiagnostic, preferredHttpProvider, instruction);
+      files.splice(files.findIndex((file) => file.path === path), 1, repair.files[0]!);
       providerByPath[path] = repair.provider ?? providerByPath[path];
-      warnings.push(`Regenerated ${path} once after ${code} validation failed.`);
+      warnings.push(`Automatically corrected ${path} after ${code} validation failed (correction ${correctionNumber}).`);
       html.inputTokens += repair.inputTokens;
       html.outputTokens += repair.outputTokens;
-    }
-  }
+    },
+  });
   providers = [...new Set(Object.values(providerByPath).filter((provider): provider is GenerationProvider => !!provider))];
   if (providers.length > 1) warnings.push(`Static project files were generated across ${providers.join(', ')} providers.`);
   return {
@@ -1647,9 +1713,8 @@ export async function generateVanillaWebsiteWithFallback(
 export function validateVanillaProject(
   files: Array<{ path: string; content: string }>,
   provider: GenerationProvider = 'gemini',
-  options: { requireNavigation?: boolean } = {},
+  options: { navigation?: boolean } = {},
 ): void {
-  const requireNavigation = options.requireNavigation !== false;
   const byPath = new Map(files.map((file) => [file.path, file.content]));
   if (files.length !== 3 || !byPath.has('index.html') || !byPath.has('styles.css') || !byPath.has('app.js')) {
     throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'invalid_static_file_set', recoverable: false });
@@ -1667,41 +1732,48 @@ export function validateVanillaProject(
   if (!/<meta\b(?=[^>]*\bname\s*=\s*["']viewport["'])(?=[^>]*\bcontent\s*=\s*["'][^"']*width\s*=\s*device-width)[^>]*>/i.test(html)) {
     throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'viewport_meta_missing', recoverable: false });
   }
-  let menuId: string | undefined;
-  let buttonId: string | undefined;
-  if (requireNavigation) {
-    const menuToggle = [...html.matchAll(/<button\b[^>]*>/gi)].map(([tag]) => {
-      const controls = tag.match(/\baria-controls\s*=\s*["']([^"']+)["']/i)?.[1];
-      if (!controls || !/\baria-expanded\s*=\s*["'](?:true|false)["']/i.test(tag)) return undefined;
-      const escapedId = controls.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      return new RegExp(`<([a-z][\\w-]*)\\b(?=[^>]*\\bid\\s*=\\s*["']${escapedId}["'])[^>]*>([\\s\\S]*?)<\\/\\1\\s*>`, 'i').test(html) ? { controls, buttonTag: tag } : undefined;
-    }).find(Boolean);
-    if (!/<nav\b/i.test(html) || !menuToggle || !/<nav\b[^>]*>[\\s\\S]*?<a\b/i.test(html)) {
-      throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_navigation_missing', recoverable: false });
-    }
-    menuId = menuToggle.controls;
-    buttonId = menuToggle.buttonTag.match(/\bid\s*=\s*["']([^"']+)["']/i)?.[1];
-    const safeId = (id: string | undefined) => !!id && /^[a-z][a-z\d_-]{0,63}$/i.test(id);
-    const hasSafeNavigationIds = safeId(buttonId) && safeId(menuId);
-    if (!hasSafeNavigationIds) throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_navigation_ids_invalid', recoverable: false });
+  const navigationEnabled = options.navigation !== false;
+  const menuToggle = [...html.matchAll(/<button\b[^>]*>/gi)].map(([tag]) => {
+    const controls = tag.match(/\baria-controls\s*=\s*["']([^"']+)["']/i)?.[1];
+    if (!controls || !/\baria-expanded\s*=\s*["'](?:true|false)["']/i.test(tag)) return undefined;
+    const escapedId = controls.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`<([a-z][\\w-]*)\\b(?=[^>]*\\bid\\s*=\\s*["']${escapedId}["'])[^>]*>([\\s\\S]*?)<\\/\\1\\s*>`, 'i').test(html) ? { controls, buttonTag: tag } : undefined;
+  }).find(Boolean);
+  if (navigationEnabled && (!/<nav\b/i.test(html) || !menuToggle || !/<nav\b[^>]*>[\\s\\S]*?<a\b/i.test(html))) {
+    throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_navigation_missing', recoverable: false });
   }
+  const menuId = menuToggle?.controls;
+  const buttonId = menuToggle?.buttonTag.match(/\bid\s*=\s*["']([^"']+)["']/i)?.[1];
+  const safeId = (id: string | undefined) => !!id && /^[a-z][a-z\d_-]{0,63}$/i.test(id);
+  if (navigationEnabled && !(safeId(buttonId) && safeId(menuId))) throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_navigation_ids_invalid', recoverable: false });
   if (!hasBalancedCss(css)) throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'stylesheet_incomplete', recoverable: false });
-  if (requireNavigation) {
-    if (!(css.includes(`#${menuId}`) || css.includes(`[aria-controls="${menuId}"]`))) throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_menu_styles_missing', recoverable: false });
-    if (!js.includes(`#${buttonId}`) || !js.includes(`#${menuId}`) || !/setAttribute\s*\(\s*["']aria-expanded["']/i.test(js) || !/addEventListener/i.test(js) || !/Escape/i.test(js)) {
-      throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_navigation_behavior_missing', recoverable: false });
-    }
-  }
-  if (!/box-sizing\s*:\s*border-box/i.test(css) || !/img[^{}]*\{[^}]*max-width\s*:\s*100%/i.test(css)) {
-    throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_content_constraints_missing', recoverable: false });
-  }
-  const breakpoints = [...css.matchAll(/@media[^{}]*?max-width\s*:\s*(\d+(?:\.\d+)?)\s*(px|rem|em)\b/gi)]
-    .map((match) => Number(match[1]) * (match[2]?.toLowerCase() === 'px' ? 1 : 16));
-  if (!breakpoints.some((width) => width <= 768) || !breakpoints.some((width) => width > 768 && width <= 1024)) {
-    throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_breakpoints_missing', recoverable: false });
+  if (navigationEnabled && !(css.includes(`#${menuId}`) || css.includes(`[aria-controls="${menuId}"]`))) throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_menu_styles_missing', recoverable: false });
+  if (navigationEnabled && (!js.includes(`#${buttonId}`) || !js.includes(`#${menuId}`) || !/setAttribute\s*\(\s*["']aria-expanded["']/i.test(js) || !/addEventListener/i.test(js) || !/Escape/i.test(js))) {
+    throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'responsive_navigation_behavior_missing', recoverable: false });
   }
   try { new Script(js, { filename: 'app.js' }); }
   catch { throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'javascript_syntax_error', recoverable: false }); }
+}
+
+/** Validate the single-request format without requiring separate assets or a fixed design scaffold. */
+export function validateGeneratedStaticWebsite(
+  files: Array<{ path: string; content: string }>,
+  provider: GenerationProvider = 'groq',
+  options: { singleRequestMode?: boolean; navigation?: boolean } = {},
+): void {
+  const html = files.find((file) => file.path.toLowerCase() === 'index.html')?.content ?? '';
+  const hasStyles = files.some((file) => file.path === 'styles.css' && file.content.trim()) || /<style\b[^>]*>[\s\S]*?\S[\s\S]*?<\/style\s*>/i.test(html);
+  const hasScript = files.some((file) => file.path === 'app.js' && file.content.trim()) || /<script\b(?![^>]*\bsrc\s*=)[^>]*>[\s\S]*?\S[\s\S]*?<\/script\s*>/i.test(html);
+  const completeDocument = /<!doctype\s+html\s*>/i.test(html)
+    && /<html\b/i.test(html) && /<head\b/i.test(html) && /<\/head\s*>/i.test(html)
+    && /<body\b/i.test(html) && /<\/body\s*>/i.test(html) && /<\/html\s*>/i.test(html)
+    && isBalancedHtml(html)
+    && /<meta\b(?=[^>]*\bname\s*=\s*["']viewport["'])(?=[^>]*\bcontent\s*=\s*["'][^"']*width\s*=\s*device-width)[^>]*>/i.test(html);
+  if (!html.trim() || !completeDocument) {
+    throw new ProviderFailure({ provider, category: 'invalid_output', providerCode: 'incomplete_html_document', recoverable: false });
+  }
+  if (options.singleRequestMode || !hasStyles || !hasScript) return;
+  validateVanillaProject(files, provider, { navigation: options.navigation });
 }
 
 function isBalancedHtml(html: string): boolean {

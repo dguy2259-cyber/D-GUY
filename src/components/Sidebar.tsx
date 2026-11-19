@@ -40,7 +40,7 @@ interface SidebarProps {
 
 export function Sidebar({ collapsed, activeKey, onToggleCollapsed, onNavigate }: SidebarProps) {
   const [apiStatus, setApiStatus] = useState<'checking' | 'online' | 'offline'>('checking');
-  const [provider, setProvider] = useState('Gemini + Groq');
+  const [provider, setProvider] = useState('Checking');
   useEffect(() => {
     let active = true;
     void Promise.all([backendApi.health(), backendApi.ready()]).then(([health]) => {

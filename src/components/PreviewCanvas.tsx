@@ -42,7 +42,22 @@ export function PreviewCanvas({ version, viewport, refreshKey, buildingLabel, on
       if (payload.type === 'dguy:preview-layout' && 'width' in event.data && 'overflow' in event.data) {
         const layout = event.data as { width: unknown; overflow: unknown };
         if (Number.isFinite(layout.width) && Number.isFinite(layout.overflow)) {
-          setLayoutAudit({ width: Number(layout.width), overflow: Number(layout.overflow) });
+          const width = Number(layout.width);
+          const overflow = Number(layout.overflow);
+          setLayoutAudit({ width, overflow });
+          if (overflow > 1 && version?.id) {
+            const report: RuntimeErrorReport = {
+              versionId: version.id,
+              environment: 'sandbox_html',
+              category: 'runtime',
+              message: `Responsive layout overflow at ${width}px: content extends ${overflow}px beyond the viewport.`,
+            };
+            const key = `responsive_overflow:${width}:${overflow}`;
+            if (!reportedErrors.current.has(key)) {
+              reportedErrors.current.add(key);
+              onRuntimeError(report);
+            }
+          }
         }
         return;
       }
@@ -184,7 +199,7 @@ function createSandboxDocument(html: string, files: ProjectFile[]) {
   const reporter = source.createElement('script');
   reporter.textContent = `(()=>{const send=(category,message,detail)=>{try{parent.postMessage({type:'dguy:preview-error',category,message:String(message).slice(0,2000),stackTrace:String(detail?.stack||'').slice(0,6000),sourceFile:String(detail?.filename||'').slice(0,500),line:Number(detail?.lineno)||undefined,column:Number(detail?.colno)||undefined},'*')}catch{}};addEventListener('error',event=>{if(event instanceof ErrorEvent&&event.message)send('runtime',event.message,event)},true);addEventListener('unhandledrejection',event=>{const reason=event.reason;if(reason instanceof Error)send('unhandled_rejection',reason.message,reason);else if(typeof reason==='string'&&reason)send('unhandled_rejection',reason,{})},true)})()`;
   const layoutReporter = source.createElement('script');
-  layoutReporter.textContent = `(()=>{let timer;const check=()=>{const width=document.documentElement.clientWidth||innerWidth;const clipped=element=>{for(let ancestor=element.parentElement;ancestor&&ancestor!==document.body;ancestor=ancestor.parentElement){const overflow=getComputedStyle(ancestor).overflowX;if(overflow==='hidden'||overflow==='clip')return true}return false};let maxRight=width;let minLeft=0;for(const element of document.querySelectorAll('body *')){const style=getComputedStyle(element);if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)continue;const rect=element.getBoundingClientRect();if(rect.width&&rect.height&&!clipped(element)){if(rect.right>width+1)maxRight=Math.max(maxRight,rect.right);if(rect.left< -1)minLeft=Math.min(minLeft,rect.left)}}const overflow=Math.max(0,Math.ceil(maxRight-width),Math.ceil(-minLeft));try{parent.postMessage({type:'dguy:preview-layout',width,overflow},'*')}catch{}};addEventListener('load',()=>setTimeout(check,650));addEventListener('resize',()=>{clearTimeout(timer);timer=setTimeout(check,650)});setTimeout(check,650)})()`;
+  layoutReporter.textContent = `(()=>{let timer;const check=()=>{const root=document.documentElement;const body=document.body;const width=root.clientWidth||innerWidth;const clipped=element=>{for(let ancestor=element.parentElement;ancestor&&ancestor!==body;ancestor=ancestor.parentElement){const overflow=getComputedStyle(ancestor).overflowX;if(overflow==='hidden'||overflow==='clip')return true}return false};let maxRight=width;let minLeft=0;for(const element of document.querySelectorAll('body *')){const style=getComputedStyle(element);if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)continue;const rect=element.getBoundingClientRect();if(rect.width&&rect.height&&!clipped(element)){if(rect.right>width+1)maxRight=Math.max(maxRight,rect.right);if(rect.left< -1)minLeft=Math.min(minLeft,rect.left)}}const documentOverflow=Math.max(root.scrollWidth,body.scrollWidth)-width;const overflow=Math.max(0,Math.ceil(maxRight-width),Math.ceil(-minLeft),Math.ceil(documentOverflow));try{parent.postMessage({type:'dguy:preview-layout',width,overflow},'*')}catch{}};addEventListener('load',()=>setTimeout(check,650));addEventListener('resize',()=>{clearTimeout(timer);timer=setTimeout(check,650)});setTimeout(check,650)})()`;
   const csp = source.createElement('meta');
   csp.httpEquiv = 'Content-Security-Policy';
   csp.content = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://esm.sh; style-src 'unsafe-inline' https://cdn.tailwindcss.com; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";

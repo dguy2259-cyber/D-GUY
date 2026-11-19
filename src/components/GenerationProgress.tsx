@@ -31,11 +31,11 @@ export function GenerationProgress({ generation }: GenerationProgressProps) {
         {running && <span className="font-mono text-xs text-stone">{formatSeconds(elapsed)}</span>}
       </div>
 
-      {generation.saveState === 'retrying' && (
-        <p role="status" className="mt-3 text-sm text-stone">{generation.saveWarning || 'Preview ready; saving the version in the background.'}</p>
+      {generation.saveState === 'retrying' && generation.status !== 'error' && (
+        <p role="status" className="mt-3 text-sm text-stone">{generation.saveWarning || 'Saving the generated version in the background.'}</p>
       )}
       {generation.saveState === 'failed' && (
-        <p role="alert" className="mt-3 text-sm text-[#8A3A32]">{generation.saveWarning || 'Preview is ready, but the project version was not saved.'}</p>
+        <p role="alert" className="mt-3 text-sm text-[#8A3A32]">{generation.saveWarning || 'Files generated, but saving failed. Your previous saved version remains active.'}</p>
       )}
 
       {generation.status === 'error' ? (
@@ -85,15 +85,17 @@ export function GenerationProgress({ generation }: GenerationProgressProps) {
 
       {generation.kind === 'create' && generation.expectedFiles.length > 0 && (
         <div className="mt-4 rounded-xl bg-cream p-3 shadow-clay-inset">
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-stone">{generation.status === 'complete' ? 'Project files' : 'Files generated this attempt'}</p>
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-stone">{generation.status === 'complete' ? 'Project files' : generation.status === 'error' ? 'Incomplete files from failed attempt' : 'Files generated this attempt'}</p>
           <ul className="space-y-1.5 font-mono text-[11px] text-charcoal">
             {generation.expectedFiles.map((path) => {
-              const written = generation.status === 'complete' || generation.expectedFiles.includes(path);
+              const written = generation.status === 'complete';
               const writing = !written && generation.status === 'running' && generation.stages[generation.stageIndex]?.id === 'generating';
               return (
                 <li key={path} className="flex items-center gap-2">
                   {written ? (
                     <Check size={12} className="text-slate" />
+                  ) : generation.status === 'error' ? (
+                    <AlertCircle size={12} className="text-[#8A3A32]" />
                   ) : writing ? (
                     <Loader2 size={12} className="animate-spin text-terracotta-deep" />
                   ) : (

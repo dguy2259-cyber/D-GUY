@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { consumeDistributedRateLimit, rateLimitBucketKey } from './rateLimit.js';
+import { consumeDistributedRateLimit, isRateLimitExemptRole, rateLimitBucketKey } from './rateLimit.js';
 
 describe('distributed PostgreSQL rate limits', () => {
+  it('exempts only verified administrator roles from application rate limits', () => {
+    expect(isRateLimitExemptRole('admin')).toBe(true);
+    expect(isRateLimitExemptRole('client')).toBe(false);
+    expect(isRateLimitExemptRole(undefined)).toBe(false);
+  });
+
   it('hashes scope and client address so IPs are not stored in plaintext', () => {
     const key = rateLimitBucketKey('/api/v1/auth/login', '203.0.113.10', 'test-only-secret');
     expect(key).toMatch(/^[a-f0-9]{64}$/);

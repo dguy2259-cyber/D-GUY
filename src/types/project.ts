@@ -10,14 +10,14 @@ export interface SiteOptions {
   palette: PaletteId;
   testimonials: boolean;
   premiumHero: boolean;
-  menuBar: boolean;
+  navigation: boolean;
 }
 
 export interface RequirementOverrides {
   templateId: TemplateId | null;
   palette: PaletteId | null;
   testimonials: boolean | null;
-  menuBar: boolean | null;
+  navigation: boolean | null;
 }
 
 export interface ProjectFile {

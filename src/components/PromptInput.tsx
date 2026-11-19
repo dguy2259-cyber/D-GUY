@@ -1,13 +1,20 @@
 import { useRef, useState } from 'react';
 import type { ChangeEvent, KeyboardEvent } from 'react';
-import { Paperclip, Sparkles, X } from 'lucide-react';
+import { Paperclip, Sparkles, X, AlertCircle } from 'lucide-react';
 
 const MAX_ATTACHMENT_BYTES = 200_000;
 const MAX_ATTACHMENT_CHARS = 4000;
+const ALLOWED_MIME_TYPES = ['text/plain', 'text/markdown', 'text/csv', 'application/json', 'application/csv'];
+const ALLOWED_EXTENSIONS = ['.txt', '.md', '.csv', '.json'];
 
 interface Attachment {
   name: string;
   text: string;
+}
+
+function isTextFile(file: File): boolean {
+  const extension = file.name.toLowerCase().split('.').pop() ? `.${file.name.toLowerCase().split('.').pop()}` : '';
+  return ALLOWED_EXTENSIONS.includes(extension) || ALLOWED_MIME_TYPES.includes(file.type);
 }
 
 interface PromptInputProps {
@@ -46,6 +53,10 @@ export function PromptInput({ value, onChange, onSubmit, disabled, submitLabel, 
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file) return;
+    if (!isTextFile(file)) {
+      setAttachError('Only text files are supported (.txt, .md, .csv, .json). Images and binary files cannot be attached.');
+      return;
+    }
     if (file.size > MAX_ATTACHMENT_BYTES) {
       setAttachError('That file is too large. Attach a brief under 200 KB.');
       return;
@@ -85,7 +96,12 @@ export function PromptInput({ value, onChange, onSubmit, disabled, submitLabel, 
           </button>
         </div>
       )}
-      {attachError && <p className="mt-2 text-xs text-[#8A3A32]">{attachError}</p>}
+      {attachError && (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-[#8A3A32]">
+          <AlertCircle size={12} className="shrink-0" />
+          {attachError}
+        </p>
+      )}
 
       <div className="mt-3 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
@@ -95,7 +111,7 @@ export function PromptInput({ value, onChange, onSubmit, disabled, submitLabel, 
             accept=".txt,.md,.csv,.json"
             className="hidden"
             onChange={handleFile}
-            aria-label="Attach a brief"
+            aria-label="Attach a text brief"
           />
           <button
             type="button"

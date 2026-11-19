@@ -45,6 +45,7 @@ model Project {
   versions       Version[]
   jobs           GenerationJob[]
   recoverySessions RuntimeRecoverySession[]
+  aiOwnership    ProjectAiOwnership?
 
   @@index([ownerId, updatedAt])
 }
@@ -156,4 +157,23 @@ model RuntimeRecoveryAttempt {
   @@unique([sessionId, attemptNumber])
   @@index([sessionId, startedAt])
   @@index([generationJobId])
+}
+
+model ProjectAiOwnership {
+  id                       String   @id @default(cuid())
+  projectId                String   @unique
+  conversationId           String?
+  ownerProvider            String
+  ownerModel               String
+  ownerModelVersion        String?
+  ownershipStatus          String   @default("active")
+  lastSuccessfulGenerationId String?
+  lastSuccessfulVersionId  String?
+  ownershipRevision        Int      @default(1)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+  project                  Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([ownerProvider])
 }

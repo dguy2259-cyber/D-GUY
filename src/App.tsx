@@ -140,7 +140,7 @@ function App() {
           templateId: current.activeVersion?.templateId ?? 'saas',
           palette: null,
           testimonials: null,
-          menuBar: null,
+          navigation: null,
         };
         const candidate = await workspaceRef.current.submitPrompt(prompt, requirements, attempt.id);
         if (!candidate) {

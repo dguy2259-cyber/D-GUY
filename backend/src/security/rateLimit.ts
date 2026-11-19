@@ -4,6 +4,10 @@ export interface RateLimitPool {
   query(sql: string, values: unknown[]): Promise<{ rows: Array<{ hits: number; retryAfterSeconds: number | string }> }>;
 }
 
+export function isRateLimitExemptRole(role: unknown): boolean {
+  return role === 'admin';
+}
+
 export function rateLimitBucketKey(scope: string, clientAddress: string, secret: string): string {
   return createHmac('sha256', secret).update(`${scope}\0${clientAddress}`).digest('hex');
 }

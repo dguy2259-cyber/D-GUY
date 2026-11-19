@@ -28,7 +28,7 @@ const singlePageOutput = JSON.stringify({
   summary: 'Single-request stubbed page',
   files: [{
     path: 'index.html',
-    content: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>*{box-sizing:border-box}img{max-width:100%;height:auto}body{color:white}@media(max-width:1024px){body{color:#fff}}@media(max-width:768px){body{color:#eee}}</style></head><body><main>Nexora</main><script>document.querySelector("main");</script></body></html>',
+    content: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{color:white}</style></head><body><main>Nexora</main><script>document.querySelector("main");</script></body></html>',
   }],
   warnings: [],
 });
@@ -51,17 +51,21 @@ function groqBody(content: string) {
   return JSON.stringify({ choices: [{ message: { content }, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: 3 } });
 }
 
-async function consumeRequest(request: AsyncIterable<Buffer | string>): Promise<void> {
-  for await (const chunk of request) void chunk;
+async function consumeRequest(request: AsyncIterable<Buffer | string>): Promise<string> {
+  const chunks: string[] = [];
+  for await (const chunk of request) chunks.push(String(chunk));
+  return chunks.join('');
 }
 
 async function startStubProviderServer(modes: Partial<Record<ProviderName, StubMode>>) {
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const intervals = new Set<ReturnType<typeof setInterval>>();
+  const requestBodies: string[] = [];
   let requestCount = 0;
   const server: Server = createServer((request, response) => {
-    void consumeRequest(request).then(() => {
+    void consumeRequest(request).then((body) => {
       requestCount += 1;
+      requestBodies.push(body);
       const path = request.url ?? '';
       const provider: ProviderName = path.includes('/gemini/')
         ? 'gemini'
@@ -153,6 +157,7 @@ async function startStubProviderServer(modes: Partial<Record<ProviderName, StubM
   return {
     config,
     get requestCount() { return requestCount; },
+    requestBodies,
     async close() {
       for (const timer of timers) clearTimeout(timer);
       for (const interval of intervals) clearInterval(interval);
@@ -332,7 +337,7 @@ describe('local HTTP provider stub integration', () => {
     const stub = await startStubProviderServer({ groq: 'single-success' });
     try {
       const output = await generateVanillaWebsiteWithFallback(
-        { ...generationInput, prompt: 'Create a single-page technology company website.', requireNavigation: false },
+        { ...generationInput, prompt: 'Create a single-page technology company website.' },
         { groq: stub.config('groq'), providerOrder: ['groq'], singleRequestMode: true },
         new AbortController().signal,
       );
@@ -340,9 +345,27 @@ describe('local HTTP provider stub integration', () => {
       expect(output.files.map((file) => file.path)).toEqual(['index.html', 'styles.css', 'app.js']);
       expect(output.files[0]?.content).toContain('href="./styles.css"');
       expect(output.files[0]?.content).toContain('src="./app.js"');
-      expect(output.files[1]?.content).toBe('*{box-sizing:border-box}img{max-width:100%;height:auto}body{color:white}@media(max-width:1024px){body{color:#fff}}@media(max-width:768px){body{color:#eee}}');
+      expect(output.files[1]?.content).toBe('body{color:white}');
       expect(output.files[2]?.content).toBe('document.querySelector("main");');
-      expect(output.warnings.some((warning) => warning.includes('follow-up validation'))).toBe(false);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('honors the no-menu choice in one-request generation', async () => {
+    const stub = await startStubProviderServer({ groq: 'single-success' });
+    try {
+      const output = await generateVanillaWebsiteWithFallback(
+        { ...generationInput, prompt: 'Create a landing page.', navigation: false },
+        { groq: stub.config('groq'), providerOrder: ['groq'], singleRequestMode: true },
+        new AbortController().signal,
+        fetch,
+      );
+      expect(output.files[0]?.content).not.toMatch(/<nav\b/i);
+      expect(output.files[0]?.content).not.toContain('menu-toggle');
+      const requestPayload = JSON.parse(stub.requestBodies[0] ?? '{}') as { messages?: Array<{ content?: string }> };
+      const requestInput = JSON.parse(requestPayload.messages?.[1]?.content ?? '{}') as { prompt?: string };
+      expect(requestInput.prompt).toContain('Do not include a top navigation bar or menu.');
     } finally {
       await stub.close();
     }

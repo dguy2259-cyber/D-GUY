@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { clearProviderHealthForTests, JsonContentFieldStreamer, generateWithFallback, generateWithGemini, generateWithGroq, generateWithOpenRouter, generateWebsiteWithFallback, generateVanillaWebsiteWithFallback, probeGemini, validateVanillaProject, type GenerationEvent } from './provider.js';
+import { clearProviderHealthForTests, JsonContentFieldStreamer, generateWithFallback, generateWithGemini, generateWithGroq, generateWithOpenRouter, generateWebsiteWithFallback, generateVanillaWebsiteWithFallback, probeGemini, normalizeStaticWebsiteFiles, validateGeneratedStaticWebsite, validateVanillaProject, type GenerationEvent } from './provider.js';
 
 const groq = { baseUrl: 'https://api.groq.com/openai/v1', apiKey: 'groq-test-secret', model: 'qwen/qwen3.8-27b', timeoutMs: 5000 };
 const gemini = { baseUrl: 'https://generativelanguage.googleapis.com', apiKey: 'gemini-test-secret', model: 'gemini-3.8-flash', timeoutMs: 5000 };
@@ -171,6 +171,13 @@ describe('real provider adapters (mock HTTP; no provider credits)', () => {
     await expect(generateWithGemini(input, gemini, new AbortController().signal, vi.fn().mockResolvedValue(geminiResponse('{"summary":"partial"', 'MAX_TOKENS')) as typeof fetch)).rejects.toThrow('invalid_output [output_truncated]');
   });
 
+  it('never promotes a complete-looking file salvaged from a truncated provider response', async () => {
+    const html = '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><main>Bakery</main></body></html>';
+    const truncated = geminiResponse(JSON.stringify({ summary: 'Bakery', files: [{ path: 'index.html', content: html }], warnings: [] }), 'MAX_TOKENS');
+    await expect(generateWebsiteWithFallback({ ...input, expectedFilePath: 'index.html', requirePreview: false }, { gemini, providerOrder: ['gemini'] }, new AbortController().signal, vi.fn().mockResolvedValue(truncated) as typeof fetch))
+      .rejects.toMatchObject({ failures: expect.arrayContaining([expect.objectContaining({ providerCode: 'output_truncated' })]) });
+  });
+
   it('rejects malformed OpenRouter tool-call output without repeating the paid request', async () => {
     const malformed = makeResponse(200, sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call', function: { name: 'return_dguy_project', arguments: '{bad json' } }] }, finish_reason: 'tool_calls' }] }]));
     const fetcher = vi.fn().mockResolvedValue(malformed);
@@ -216,6 +223,44 @@ describe('real provider adapters (mock HTTP; no provider credits)', () => {
     }
     const cssAndJsInputs = fetcher.mock.calls.slice(1).map(([, init]) => JSON.parse(String(init?.body)).contents[0].parts[0].text).map((content: string) => JSON.parse(content));
     expect(cssAndJsInputs.every((taskInput: { currentFiles: Array<{ path: string }> }) => taskInput.currentFiles[0]?.path === 'index.html')).toBe(true);
+  });
+
+  it('accepts a complete single-request HTML site when separate CSS or JavaScript is unnecessary', async () => {
+    const html = '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:system-ui}</style></head><body><main><h1>Bakery</h1><p>Fresh bread every morning.</p></main></body></html>';
+    const response = groqResponse(JSON.stringify({ summary: 'Bakery landing page', files: [{ path: 'index.html', content: html }], warnings: [] }));
+    const result = await generateVanillaWebsiteWithFallback({ prompt: 'Create a simple bakery landing page.', currentFiles: [], mode: 'create', navigation: false }, { groq, providerOrder: ['groq'], singleRequestMode: true }, new AbortController().signal, vi.fn().mockResolvedValue(response) as typeof fetch);
+    expect(result.files.map((file) => file.path)).toEqual(['index.html', 'styles.css']);
+    expect(result.files.find((file) => file.path === 'styles.css')?.content).toContain('font-family:system-ui');
+    expect(result.files.some((file) => file.path === 'app.js')).toBe(false);
+    expect(result.warnings.some((warning) => warning.includes('follow-up validation'))).toBe(false);
+  });
+
+  it('normalizes inline styles and omits empty optional assets', () => {
+    const files = normalizeStaticWebsiteFiles([
+      { path: 'index.html', content: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{color:#222}</style></head><body><main>Hi</main><script src="./app.js"></script></body></html>' },
+      { path: 'styles.css', content: '' },
+      { path: 'app.js', content: '   ' },
+    ]);
+    expect(files.map((file) => file.path)).toEqual(['index.html', 'styles.css']);
+    expect(files[0]!.content).toContain('href="./styles.css"');
+    expect(files[0]!.content).not.toContain('src="./app.js"');
+    expect(files[1]!.content).toContain('body{color:#222}');
+  });
+
+  it('does not reject a complete single-request site for optional responsive CSS/JavaScript heuristics', () => {
+    const files = [
+      { path: 'index.html', content: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><main><h1>Bakery</h1></main></body></html>' },
+      { path: 'styles.css', content: 'body { font-family: system-ui; }' },
+    ];
+    expect(() => validateGeneratedStaticWebsite(files, 'groq', { singleRequestMode: true })).not.toThrow();
+    expect(() => validateGeneratedStaticWebsite([{ ...files[0]!, content: files[0]!.content.replace('</body>', '') }], 'groq', { singleRequestMode: true })).toThrow('incomplete_html_document');
+    const threeFiles = [
+      { ...files[0]!, content: files[0]!.content.replace('</head>', '<link rel="stylesheet" href="styles.css"></head>').replace('</body>', '<script defer src="app.js"></script></body>') },
+      files[1]!,
+      { path: 'app.js', content: 'document.querySelector("main");' },
+    ];
+    expect(() => validateVanillaProject(threeFiles, 'groq', { navigation: false })).not.toThrow();
+    expect(() => validateGeneratedStaticWebsite(threeFiles, 'groq', { singleRequestMode: true, navigation: false })).not.toThrow();
   });
 
   it('discards partial streamed source when a provider fallback restarts a file', async () => {
@@ -334,21 +379,16 @@ describe('real provider adapters (mock HTTP; no provider credits)', () => {
     expect(() => validateVanillaProject([...valid.slice(0, 2), { path: 'app.js', content: 'document.querySelector("#menu-toggle");document.querySelector("#mobile-menu").setAttribute("aria-expanded","false");document.addEventListener("keydown",event=>{if(event.key==="Escape"){}}); function (' }])).toThrow('javascript_syntax_error');
     expect(() => validateVanillaProject([{ ...valid[0]!, content: '<html></html>' }, ...valid.slice(1)])).toThrow('static_preview_assets_not_linked');
     expect(() => validateVanillaProject([valid[0]!, { ...valid[1]!, content: 'body { color: white; @media (max-width: 768px) {' }, valid[2]!])).toThrow('stylesheet_incomplete');
-    expect(() => validateVanillaProject([valid[0]!, { ...valid[1]!, content: '* { box-sizing: border-box; } img { max-width: 100%; } #mobile-menu { display: none; } body { color: white; }' }, valid[2]!])).toThrow('responsive_breakpoints_missing');
+    expect(() => validateVanillaProject([valid[0]!, { ...valid[1]!, content: '* { box-sizing: border-box; } img { max-width: 100%; } #mobile-menu { display: none; } body { color: white; }' }, valid[2]!])).not.toThrow();
     expect(() => validateVanillaProject([{ ...valid[0]!, content: valid[0]!.content.replace(/<meta name="viewport"[^>]*>/, '') }, ...valid.slice(1)])).toThrow('viewport_meta_missing');
     expect(() => validateVanillaProject([{ ...valid[0]!, content: valid[0]!.content.replace('</div><script', '<script') }, ...valid.slice(1)])).toThrow('static_preview_assets_not_linked');
-    expect(() => validateVanillaProject([valid[0]!, { ...valid[1]!, content: '#mobile-menu{} body{} @media(max-width:1024px){} @media(max-width:768px){}' }, valid[2]!])).toThrow('responsive_content_constraints_missing');
+    expect(() => validateVanillaProject([valid[0]!, { ...valid[1]!, content: '#mobile-menu{} body{} @media(max-width:1024px){} @media(max-width:768px){}' }, valid[2]!])).not.toThrow();
     expect(() => validateVanillaProject([valid[0]!, valid[1]!, { ...valid[2]!, content: 'document.addEventListener("keydown",()=>{});' }])).toThrow('responsive_navigation_behavior_missing');
-  });
-
-  it('validates a static website without requiring a top menu when the user opts out', () => {
-    const files = [
-      { path: 'index.html', content: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="./styles.css"></head><body><main>Welcome</main><script defer src="./app.js"></script></body></html>' },
-      { path: 'styles.css', content: '*{box-sizing:border-box}img{max-width:100%;height:auto}body{margin:0}@media(max-width:1024px){body{padding:1rem}}@media(max-width:768px){body{padding:.5rem}}' },
-      { path: 'app.js', content: 'document.querySelector("main");' },
-    ];
-    expect(() => validateVanillaProject(files, 'groq', { requireNavigation: false })).not.toThrow();
-    expect(() => validateVanillaProject(files, 'groq')).toThrow('responsive_navigation_missing');
+    const noNavigationHtml = valid[0]!.content
+      .replace(/<nav>[\s\S]*?<\/nav>/i, '')
+      .replace(/<div id="mobile-menu">[\s\S]*?<\/div>/i, '');
+    expect(() => validateVanillaProject([{ ...valid[0]!, content: noNavigationHtml }, ...valid.slice(1)], 'groq', { navigation: false })).not.toThrow();
+    expect(() => validateVanillaProject([{ ...valid[0]!, content: noNavigationHtml }, ...valid.slice(1)])).toThrow('responsive_navigation_missing');
   });
 
   it('regenerates and validates all three files for a natural-language static-site revision', async () => {
@@ -400,7 +440,7 @@ describe('real provider adapters (mock HTTP; no provider credits)', () => {
     });
     const result = await generateVanillaWebsiteWithFallback({ prompt: 'Build a responsive static portfolio website.', currentFiles: [], mode: 'create' }, { groq, gemini, openRouter, providerOrder: ['gemini', 'groq', 'openrouter'] }, new AbortController().signal, fetcher as typeof fetch);
     expect(result.files.find((file) => file.path === 'styles.css')?.content).toBe(content['styles.css']);
-    expect(result.warnings).toContain('Regenerated styles.css once after stylesheet_incomplete validation failed.');
+    expect(result.warnings).toContain('Automatically corrected styles.css after stylesheet_incomplete validation failed (correction 1).');
     expect(fetcher).toHaveBeenCalledTimes(4);
     const repairInput = JSON.parse(String(fetcher.mock.calls[3]?.[1]?.body)).contents[0].parts[0].text;
     expect(repairInput).toContain('stylesheet_incomplete');
@@ -489,6 +529,16 @@ describe('real provider adapters (mock HTTP; no provider credits)', () => {
     const result = await generateWithGroq(input, groq, new AbortController().signal, fetcher as typeof fetch);
     expect(result.summary).toBe(answer.summary);
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('exposes Groq API-key rate-limit headers through sanitized diagnostics', async () => {
+    const diagnostics: Array<Record<string, unknown>> = [];
+    const response = makeJsonResponse({ choices: [{ message: { content: JSON.stringify(answer) }, finish_reason: 'stop' }], usage: { prompt_tokens: 17, completion_tokens: 31 } });
+    const wrapped = new Response(response.body, { status: 200, headers: { 'content-type': 'application/json', 'x-groq-id': 'req-test-123', 'x-ratelimit-limit-requests': '1000', 'x-ratelimit-remaining-requests': '984', 'x-ratelimit-reset-requests': '2h15m10s', 'x-ratelimit-limit-tokens': '8000', 'x-ratelimit-remaining-tokens': '7020', 'x-ratelimit-reset-tokens': '8.5s' } });
+    await generateWithGroq(input, groq, new AbortController().signal, vi.fn().mockResolvedValue(wrapped) as typeof fetch, undefined, (event) => diagnostics.push(event));
+    expect(diagnostics.find((event) => event.stage === 'response_headers')?.rateLimit).toEqual({ remainingRequests: 984, limitRequests: 1000, resetRequestsMs: 8_110_000, remainingTokens: 7020, limitTokens: 8000, resetTokensMs: 8500 });
+    expect(diagnostics.find((event) => event.stage === 'response_headers')?.providerRequestId).toBe('req-test-123');
+    expect(diagnostics.find((event) => event.stage === 'response_complete')?.finishReason).toBe('stop');
   });
 
   it('sends the Gemini key in a header and validates its structured response', async () => {
@@ -627,6 +677,21 @@ describe('real provider adapters (mock HTTP; no provider credits)', () => {
     expect(error).toMatchObject({ info: { status: 400, category: 'invalid_request', providerCode: 'invalid_request_error', providerField: 'response_format' } });
     expect(error.message).not.toContain('provider private text');
     expect(error.message).not.toContain('do-not-leak');
+  });
+
+  it('retries Groq json_validate_failed once with JSON-object mode and validates locally', async () => {
+    const diagnostics: Array<Record<string, unknown>> = [];
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(makeResponse(400, JSON.stringify({ error: { type: 'invalid_request_error', code: 'json_validate_failed', message: 'Failed to generate JSON. Please adjust your prompt.' } }), { 'content-type': 'application/json' }))
+      .mockResolvedValueOnce(groqResponse());
+    const result = await generateWithGroq(input, groq, new AbortController().signal, fetcher as typeof fetch, undefined, (event) => diagnostics.push(event));
+    const firstRequest = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
+    const retryRequest = JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body));
+    expect(firstRequest.response_format.type).toBe('json_schema');
+    expect(retryRequest.response_format).toEqual({ type: 'json_object' });
+    expect(result.files[0]?.path).toBe('index.html');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(diagnostics).toContainEqual(expect.objectContaining({ stage: 'format_fallback', providerCode: 'json_validate_failed' }));
   });
 
   it('accepts a non-empty HTML entrypoint and warns when preview assets are missing', async () => {

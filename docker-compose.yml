@@ -7,7 +7,6 @@ services:
       - ./backend/.env
     environment:
       NODE_ENV: ${NODE_ENV:-production}
-      PORT: 8787
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:?Set FRONTEND_ORIGIN in the root .env}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
       TRUST_PROXY: ${TRUST_PROXY:-1}

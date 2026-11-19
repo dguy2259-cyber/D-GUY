@@ -9,9 +9,11 @@ export const isSupabaseEmailVerificationCallback = isEmailSignupVerification(ver
 
 // Supabase's browser session is short-lived and scoped to this tab. The durable
 // application session is held by the backend in HttpOnly cookies.
+// detectSessionInUrl is disabled to avoid timing issues with getSession();
+// we explicitly exchange the code in googleCallbackTokens().
 export const supabaseAuth = supabaseUrl && supabaseAnonKey
   ? createClient(supabaseUrl, supabaseAnonKey, {
-      auth: { flowType: 'pkce', detectSessionInUrl: true, persistSession: true, storage: window.sessionStorage },
+      auth: { flowType: 'pkce', detectSessionInUrl: false, persistSession: true, storage: window.sessionStorage },
     })
   : null;
 
@@ -24,12 +26,15 @@ export async function beginGoogleSignIn(): Promise<void> {
       queryParams: { prompt: 'select_account' },
     },
   });
-  if (error) throw new Error('Google sign-in could not start. Check the Supabase Google provider setup and allowed redirect URLs.');
+  if (error) throw new Error('Google sign-in could not be started. Check the Supabase Google provider setup and allowed redirect URLs.');
 }
 
 export async function googleCallbackTokens(): Promise<{ accessToken: string; refreshToken: string }> {
   if (!supabaseAuth) throw new Error('Google sign-in is not configured.');
-  const { data, error } = await supabaseAuth.auth.getSession();
+  const query = new URLSearchParams(window.location.search);
+  const code = query.get('code');
+  if (!code) throw new Error('Missing authorization code in callback URL.');
+  const { data, error } = await supabaseAuth.auth.exchangeCodeForSession(code);
   if (error || !data.session) throw new Error('Google sign-in could not be completed. Try again.');
   const metadata = data.session.user.app_metadata;
   const providers = [
@@ -49,8 +54,16 @@ export async function clearSupabaseBrowserSession(): Promise<void> {
 
 const finishEmailVerificationOnce = createSingleFlight(async () => {
   if (!supabaseAuth) throw new Error('Email verification is not configured.');
-  const { data, error } = await supabaseAuth.auth.getSession();
-  if (error || !data.session) throw new Error('This email verification link is invalid or expired. Request another verification email.');
+  const query = new URLSearchParams(window.location.search);
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const code = query.get('code') || fragment.get('code');
+  if (!code) {
+    const { data, error } = await supabaseAuth.auth.getSession();
+    if (error || !data.session) throw new Error('This email verification link is invalid or expired. Request another verification email.');
+  } else {
+    const { error } = await supabaseAuth.auth.exchangeCodeForSession(code);
+    if (error) throw new Error('This email verification link is invalid or expired. Request another verification email.');
+  }
   const { error: signOutError } = await supabaseAuth.auth.signOut({ scope: 'local' });
   if (signOutError) throw new Error('Email verification completed, but the temporary browser session could not be cleared.');
 });

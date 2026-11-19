@@ -29,31 +29,33 @@ export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
       >
         <span className="flex items-center gap-2">
           <SlidersHorizontal size={14} />
-          Website options
+          Project requirements
         </span>
         <ChevronDown size={14} className={`transition ${open ? 'rotate-180' : ''}`} />
       </button>
 
       {open && (
-        <div className="mt-2 grid animate-fade-up gap-3 px-1 pb-1 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="mt-2 grid animate-fade-up gap-3 px-1 pb-1 sm:grid-cols-2 lg:grid-cols-4">
           <label className="grid gap-1.5 text-xs font-semibold text-stone">
             Website type
             <select
+              aria-label="Website type"
               className={selectClass}
               value={value.templateId ?? 'auto'}
               onChange={(event) =>
                 onChange({ ...value, templateId: event.target.value === 'auto' ? null : (event.target.value as TemplateId) })
               }
             >
-              <option value="auto">Auto-detect</option>
+              <option value="auto">Auto-detect from prompt</option>
               {TEMPLATE_IDS.map((id) => (
                 <option key={id} value={id}>{TEMPLATE_LABELS[id]}</option>
               ))}
             </select>
           </label>
           <label className="grid gap-1.5 text-xs font-semibold text-stone">
-            Theme
+            Color palette
             <select
+              aria-label="Color theme"
               className={selectClass}
               value={value.palette ?? 'auto'}
               onChange={(event) =>
@@ -67,22 +69,9 @@ export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
             </select>
           </label>
           <label className="grid gap-1.5 text-xs font-semibold text-stone">
-            Top menu bar
-            <select
-              className={selectClass}
-              value={value.menuBar === null ? 'auto' : value.menuBar ? 'yes' : 'no'}
-              onChange={(event) =>
-                onChange({ ...value, menuBar: event.target.value === 'auto' ? null : event.target.value === 'yes' })
-              }
-            >
-              <option value="auto">Auto-detect</option>
-              <option value="yes">Include menu</option>
-              <option value="no">No menu bar</option>
-            </select>
-          </label>
-          <label className="grid gap-1.5 text-xs font-semibold text-stone">
             Testimonials
             <select
+              aria-label="Testimonials section"
               className={selectClass}
               value={value.testimonials === null ? 'auto' : value.testimonials ? 'yes' : 'no'}
               onChange={(event) =>
@@ -95,6 +84,24 @@ export function RequirementsPanel({ value, onChange }: RequirementsPanelProps) {
               <option value="auto">Auto</option>
               <option value="yes">Include section</option>
               <option value="no">Leave out</option>
+            </select>
+          </label>
+          <label className="grid gap-1.5 text-xs font-semibold text-stone">
+            Top navigation
+            <select
+              aria-label="Top navigation menu"
+              className={selectClass}
+              value={value.navigation === null ? 'auto' : value.navigation ? 'yes' : 'no'}
+              onChange={(event) =>
+                onChange({
+                  ...value,
+                  navigation: event.target.value === 'auto' ? null : event.target.value === 'yes',
+                })
+              }
+            >
+              <option value="auto">Auto</option>
+              <option value="yes">Include menu</option>
+              <option value="no">No menu</option>
             </select>
           </label>
         </div>

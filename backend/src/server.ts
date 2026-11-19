@@ -17,13 +17,13 @@ import { createDatabasePool, databaseConnectionDiagnostics, databaseFailureCateg
 import { z } from 'zod';
 import { createSafeZip, projectFilesSchema } from './security/files.js';
 import { requestValidationFields, requestValidationMessage } from './security/requestValidation.js';
-import { generateVanillaWebsiteWithFallback, GenerationFailure, validateVanillaProject, verifyGeminiModel, verifyGroqModels } from './ai/provider.js';
+import { generateVanillaWebsiteWithFallback, GenerationFailure, ProviderFailure, validateGeneratedStaticWebsite, verifyGeminiModel, verifyGroqModels } from './ai/provider.js';
 import type { GeminiDiagnosticEvent, GenerationEvent } from './ai/provider.js';
 import { persistGeneratedVersion, ProjectVersionConflictError } from './generation/persistence.js';
 import { persistOrKeepPreview } from './generation/previewSave.js';
-import { composeWebsitePrompt } from './generation/prompt.js';
+import { buildGenerationPrompt } from './generation/buildPrompt.js';
 import { GenerationEventHistory } from './generation/eventHistory.js';
-import { generationFailureForClient, storedGenerationFailure } from './generation/failure.js';
+import { generationFailureForClient, safeGenerationFailureMessage, storedGenerationFailure } from './generation/failure.js';
 import { failInterruptedGenerations } from './generation/recovery.js';
 import { classifyRuntimeError, containsCredentialLikeValue, createRecoveryPrompt, MAX_RECOVERY_ATTEMPTS, normalizeRuntimeError, redactRuntimeText, recoveryRetryPolicy, runtimeErrorReportSchema, validateRecoveryPatch } from './recovery/runtimeError.js';
 import { isUsableSignupIdentity, registrationProfileData, registrationSchema, registrationValidationMessage, signupConfirmationUrl, SIGNUP_CONFIRMATION_MESSAGE, signupFailure, type SupabaseSignupUser } from './auth/registration.js';
@@ -51,7 +51,8 @@ const secure = process.env.COOKIE_SECURE === 'true';
 if (process.env.NODE_ENV === 'production' && !secure) throw new Error('COOKIE_SECURE=true is required in production');
 const aiProvider = process.env.AI_PROVIDER || 'groq';
 if (aiProvider !== 'groq') throw new Error('AI_PROVIDER must be groq; mock generation is disabled');
-if (process.env.AI_FALLBACK_PROVIDER !== 'gemini') throw new Error('AI_FALLBACK_PROVIDER must be gemini');
+// Provider fallback is configured by PROVIDER_ORDER; the legacy
+// AI_FALLBACK_PROVIDER setting is intentionally ignored for compatibility.
 const groqBaseUrl = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
 const geminiBaseUrl = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
 const openRouterBaseUrl = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
@@ -70,10 +71,10 @@ if (configuredTotalDeadlineMs > totalDeadlineMs) {
   logger.warn({ configuredTotalDeadlineMs, totalDeadlineMs }, 'per-provider total deadline is capped at 60000ms');
 }
 const huggingFaceTimeoutMs = z.coerce.number().int().min(1_000).max(120_000).default(10_000).parse(process.env.HF_TIMEOUT_MS);
-const configuredGenerationTotalTimeoutMs = z.coerce.number().int().min(30_000).max(360_000).default(120_000).parse(process.env.AI_GENERATION_TOTAL_TIMEOUT_MS);
-const generationTotalTimeoutMs = Math.min(configuredGenerationTotalTimeoutMs, 120_000);
-if (configuredGenerationTotalTimeoutMs > generationTotalTimeoutMs) {
-  logger.warn({ configuredGenerationTotalTimeoutMs, generationTotalTimeoutMs }, 'website generation deadline is capped at 120000ms');
+const configuredGenerationTimeoutMs = z.coerce.number().int().min(30_000).max(360_000).default(120_000).parse(process.env.AI_GENERATION_TOTAL_TIMEOUT_MS);
+const generationTotalTimeoutMs = Math.min(configuredGenerationTimeoutMs, 120_000);
+if (configuredGenerationTimeoutMs > generationTotalTimeoutMs) {
+  logger.warn({ configuredGenerationTimeoutMs, generationTotalTimeoutMs }, 'website generation deadline is capped at 120000ms');
 }
 const supabaseAuthTimeoutMs = z.coerce.number().int().min(1_000).max(30_000).default(12_000).parse(process.env.SUPABASE_AUTH_TIMEOUT_MS);
 const providerOrder = z.array(z.enum(['groq', 'gemini', 'openrouter'])).min(1)
@@ -83,7 +84,7 @@ const singleRequestMode = z.enum(['true', 'false']).default('true')
   .parse((process.env.SINGLE_REQUEST_MODE ?? 'true').toLowerCase()) === 'true';
 const aiModels = {
   reasoning: process.env.AI_MODEL || 'openai/gpt-oss-120b',
-  coding: process.env.AI_CODER_MODEL || 'qwen/qwen3.8-27b',
+  coding: process.env.AI_CODER_MODEL || 'openai/gpt-oss-120b',
   fallback: process.env.GEMINI_MODEL || process.env.AI_FALLBACK_MODEL || 'gemini-2.5-flash',
 };
 if (!process.env.GROQ_API_KEY) logger.warn({ provider: 'groq', reason: 'missing_api_key' }, 'AI provider skipped at startup');
@@ -174,6 +175,8 @@ class SupabaseUnavailableError extends Error { constructor() { super('Supabase A
 const activeControllers = new Map<string, AbortController>();
 const generationClients = new Map<string, Set<express.Response>>();
 const generationEventHistory = new GenerationEventHistory();
+let groqRateLimitSnapshot: { model: string; observedAt: number; rateLimit: NonNullable<GeminiDiagnosticEvent['rateLimit']>; cooldownUntil?: number } | null = null;
+let groqProviderState: 'ready' | 'cooldown' | 'unavailable' = 'ready';
 type GenerationSaveStatus = { state: 'retrying' | 'saved' | 'failed'; versionId?: string; updatedAt: number };
 type PendingVersionSave = { input: Parameters<typeof persistGeneratedVersion>[1]; attempts: number; timer?: ReturnType<typeof setTimeout> };
 const generationSaveStates = new Map<string, GenerationSaveStatus>();
@@ -440,8 +443,8 @@ const emailSchema = z.string().email().max(254).transform((v) => v.toLowerCase()
 const writeAudit = (userId: string, action: string, resourceId?: string) => prisma.auditEvent.create({ data: { userId, action, resourceId } }).catch((error) => logger.error({ code: (error as any)?.code, action }, 'audit event could not be stored'));
 
 app.get('/api/v1/health', (_req, res) => {
-  const providers = ['Gemini', 'Groq'];
-  if (openRouterConfig) providers.push('OpenRouter');
+  const labels: Record<string, string> = { groq: 'Groq', gemini: 'Gemini', openrouter: 'OpenRouter' };
+  const providers = providerOrder.filter((provider) => provider !== 'openrouter' || openRouterConfig).map((provider) => labels[provider]);
   if (huggingFaceConfig && huggingFaceFreeOnly) providers.push('Hugging Face Featherless');
   res.json({ status: 'ok', generationProvider: providers.join(' → ') });
 });
@@ -669,7 +672,7 @@ app.post('/api/v1/auth/password', rateLimit(5, 15 * 60_000), async (req, res, ne
   } catch (error) { next(error); }
 });
 app.get('/api/v1/projects', auth, async (req, res, next) => { try { const page = z.coerce.number().int().min(1).max(10000).default(1).parse(req.query.page); const limit = z.coerce.number().int().min(1).max(20).default(20).parse(req.query.limit); const ownerId = (req as any).user.id; res.json({ projects: await prisma.project.findMany({ where: { ownerId }, orderBy: { updatedAt: 'desc' }, skip: (page - 1) * limit, take: limit, select: { ...projectSelect, versions: { orderBy: { number: 'desc' }, take: 100, select: { id: true, number: true, prompt: true, summary: true, templateId: true, options: true, warnings: true, createdAt: true } } } }) }); } catch (e) { next(e); } });
-app.post('/api/v1/projects', auth, async (req, res, next) => { try { const body = z.object({ name: z.string().trim().min(1).max(120) }).strict().parse(req.body); const ownerId = (req as any).user.id; if (await prisma.project.count({ where: { ownerId } }) >= 20) return fail(res, 429, 'PROJECT_LIMIT', 'Project limit reached'); const p = await prisma.project.create({ data: { ownerId, name: body.name }, select: projectSelect }); res.status(201).json({ project: { ...p, versions: [] } }); } catch (e) { next(e); } });
+app.post('/api/v1/projects', auth, async (req, res, next) => { try { const body = z.object({ name: z.string().trim().min(1).max(120) }).strict().parse(req.body); const ownerId = (req as any).user.id; if (await prisma.project.count({ where: { ownerId } }) >= 20) return fail(res, 429, 'PROJECT_LIMIT', 'Project limit reached'); const p = await prisma.project.create({ data: { ownerId, name: body.name, autoRecoveryEnabled: true }, select: projectSelect }); res.status(201).json({ project: { ...p, versions: [] } }); } catch (e) { next(e); } });
 app.get('/api/v1/projects/:id', auth, async (req, res) => {
   const id = z.string().min(1).max(64).parse(req.params.id); const ownerId = (req as any).user.id as string;
   const project = await prisma.project.findFirst({ where: { id, ownerId }, select: projectSelect });
@@ -1022,11 +1025,12 @@ app.post('/api/v1/projects/:id/recovery/:sessionId/rollback', auth, requireRunti
 
 app.get('/api/v1/usage/me', auth, async (req, res) => {
   const userId = (req as any).user.id as string; const since = new Date(Date.now() - 30 * 86400000);
-  const [jobs, usage] = await Promise.all([
+  const [jobs, oldestJob, usage] = await Promise.all([
     prisma.generationJob.count({ where: { project: { ownerId: userId }, createdAt: { gte: new Date(Date.now() - 86400000) } } }),
+    prisma.generationJob.findFirst({ where: { project: { ownerId: userId }, createdAt: { gte: new Date(Date.now() - 86400000) } }, orderBy: { createdAt: 'asc' }, select: { createdAt: true } }),
     prisma.usage.aggregate({ where: { userId, createdAt: { gte: since } }, _sum: { inputTokens: true, outputTokens: true }, _count: true }),
   ]);
-  res.json({ dailyGenerationLimit: 20, generationsLast24Hours: jobs, usageLast30Days: { requests: usage._count, inputTokens: usage._sum.inputTokens ?? 0, outputTokens: usage._sum.outputTokens ?? 0 } });
+  res.json({ dailyGenerationLimit: 20, generationsLast24Hours: jobs, nextGenerationAvailableAt: jobs >= 20 && oldestJob ? oldestJob.createdAt.getTime() + 86400000 : null, usageLast30Days: { requests: usage._count, inputTokens: usage._sum.inputTokens ?? 0, outputTokens: usage._sum.outputTokens ?? 0 }, groqConfigured: !!process.env.GROQ_API_KEY, groqProviderState: groqProviderState, groq: groqRateLimitSnapshot });
 });
 app.get('/api/v1/projects/:id/export.zip', auth, async (req, res, next) => {
   try {
@@ -1157,14 +1161,20 @@ app.post('/api/v1/projects/:id/generations', rateLimit(10, 60_000, false), auth,
       return created;
     });
     await writeAudit(userId, 'generation.started', job.id);
-    res.status(202).json({ job: { id: job.id, status: job.status, progress: 0 } });
-    void generate(job.id, project.id, userId, { ...body, contextFiles }).catch((error) => logger.error({ errorName: error instanceof Error ? error.name : 'UnknownError', jobId: job.id, providerFailures: error instanceof GenerationFailure ? error.failures : undefined }, 'generation failed'));
+    logger.info({ requestId: res.locals.requestId, correlationId: job.id }, 'generation request accepted');
+    res.status(202).json({ job: { id: job.id, correlationId: job.id, status: job.status, progress: 0 } });
+    void generate(job.id, project.id, userId, { ...body, contextFiles }).catch((error) => logger.error({ correlationId: job.id, errorName: error instanceof Error ? error.name : 'UnknownError', providerFailures: error instanceof GenerationFailure ? error.failures : error instanceof ProviderFailure ? [error.info] : undefined }, 'generation task rejected'));
   } catch (error) { next(error); }
 });
 async function generate(jobId: string, projectId: string, userId: string, input: { prompt: string; templateId: string; options: Record<string, unknown>; mode: 'create' | 'revise'; contextFiles: unknown; recoveryAttemptId?: string }) {
+  const generationStartedAt = Date.now();
+  let stage = 'job_start';
+  let selectedProvider: string | undefined;
+  let selectedModel: string | undefined;
   const controller = new AbortController(); activeControllers.set(jobId, controller);
   await prisma.generationJob.update({ where: { id: jobId }, data: { status: 'running' } });
   try {
+  stage = 'planning';
   const recoveryAttempt = input.recoveryAttemptId
     ? await prisma.runtimeRecoveryAttempt.findFirst({
       where: { id: input.recoveryAttemptId, generationJobId: jobId, status: 'generating', session: { is: { status: 'generating', projectId } } },
@@ -1175,14 +1185,11 @@ async function generate(jobId: string, projectId: string, userId: string, input:
   if (recoveryAttempt && containsCredentialLikeValue(input.contextFiles)) {
     throw new RecoveryNeedsApprovalError('Credential-like values were found in project source; automatic analysis was stopped.');
   }
+  const navigationEnabled = input.options.navigation !== false;
+  const generationPrompt = buildGenerationPrompt(input.prompt, input.templateId, input.options);
   publishGeneration(jobId, 'stage', { id: 'planning', label: 'Analyzing requirements and planning the file structure' });
   const generated = await generateVanillaWebsiteWithFallback(
-    {
-      prompt: composeWebsitePrompt(input.prompt, input.templateId, input.options),
-      currentFiles: input.contextFiles,
-      mode: input.mode,
-      requireNavigation: input.options.menuBar !== false,
-    },
+    { prompt: generationPrompt, currentFiles: input.contextFiles, mode: input.mode, navigation: navigationEnabled },
     {
       providerOrder,
       singleRequestMode,
@@ -1211,14 +1218,29 @@ async function generate(jobId: string, projectId: string, userId: string, input:
     (event: GenerationEvent) => {
       if (event.type === 'provider') publishGeneration(jobId, 'stage', { id: 'generating', label: 'Generating project files with AI' });
       if (event.type === 'delta') publishGeneration(jobId, 'delta', { provider: event.provider, characters: event.text.length });
-      if (event.type === 'provider_attempt') logger.info({ jobId, ...event }, 'provider_attempt');
-      if (event.type === 'provider' || event.type === 'provider_attempt' || event.type === 'file' || event.type === 'file_started' || event.type === 'file_delta' || event.type === 'retry') publishGeneration(jobId, event.type, event);
+      if (event.type === 'provider_attempt') {
+        selectedProvider = event.provider;
+        selectedModel = event.model;
+        stage = 'provider_request';
+        logger.info({ correlationId: jobId, ...event }, 'provider_attempt');
+      }
+      if (event.type === 'provider' || event.type === 'provider_attempt' || event.type === 'file' || event.type === 'file_started' || event.type === 'file_delta' || event.type === 'retry' || event.type === 'correction') publishGeneration(jobId, event.type, event);
     },
-    (event: GeminiDiagnosticEvent) => logger.info(
-      { jobId, ...event, ...(event.provider === 'groq' ? { status: event.status ?? null, inputTokens: event.inputTokens ?? 0, outputTokens: event.outputTokens ?? 0 } : {}) },
+    (event: GeminiDiagnosticEvent) => {
+      if (event.provider) selectedProvider = event.provider;
+      if (event.model) selectedModel = event.model;
+      if (event.stage === 'response_headers' || event.stage === 'first_byte' || event.stage === 'response_complete' || event.stage === 'provider_error' || event.stage === 'request_failed' || event.stage === 'timeout') stage = event.stage;
+      if (event.provider === 'groq' && event.stage === 'response_headers') groqProviderState = event.status === 429 ? 'cooldown' : event.status && event.status >= 400 ? 'unavailable' : 'ready';
+      if (event.provider === 'groq' && event.stage === 'provider_error') groqProviderState = event.category === 'rate_limited' ? 'cooldown' : 'unavailable';
+      if (event.provider === 'groq' && event.rateLimit) groqRateLimitSnapshot = { model: event.model ?? aiModels.coding, observedAt: Date.now(), rateLimit: event.rateLimit, ...(event.retryAfterMs ? { cooldownUntil: Date.now() + event.retryAfterMs } : {}) };
+      if (event.provider === 'groq' && event.category === 'rate_limited') groqRateLimitSnapshot = { model: event.model ?? aiModels.coding, observedAt: Date.now(), rateLimit: groqRateLimitSnapshot?.rateLimit ?? {}, cooldownUntil: Date.now() + (event.retryAfterMs ?? 60_000) };
+      logger.info(
+      { correlationId: jobId, ...event, ...(event.provider === 'groq' ? { status: event.status ?? null, inputTokens: event.inputTokens ?? 0, outputTokens: event.outputTokens ?? 0 } : {}) },
       event.provider === 'groq' ? 'Groq provider request metrics' : event.stage === 'timeout' ? 'provider timeout fired' : 'provider request diagnostic',
-    ),
+      );
+    },
   );
+  stage = 'response_validation';
   if (recoveryAttempt) {
     try { validateRecoveryPatch(input.contextFiles, generated.files); }
     catch (error) {
@@ -1226,20 +1248,13 @@ async function generate(jobId: string, projectId: string, userId: string, input:
     }
   }
   const files = mergeGeneratedFiles(input.contextFiles, generated.files, input.mode);
+  stage = 'file_validation';
   publishGeneration(jobId, 'stage', { id: 'validating', label: 'Checking responsive website output' });
-  if (!files.some((file) => file.path === 'package.json') && ['index.html', 'styles.css', 'app.js'].every((path) => files.some((file) => file.path === path))) {
-    validateVanillaProject(files, generated.provider ?? 'gemini', { requireNavigation: input.options.menuBar !== false });
-  }
+  if (!files.some((file) => file.path === 'package.json')) validateGeneratedStaticWebsite(files, generated.provider ?? 'gemini', { singleRequestMode, navigation: navigationEnabled });
+  stage = 'preview_assembly';
   for (const file of files) publishGeneration(jobId, 'file', { path: file.path });
-  if (!recoveryAttempt) {
-    publishGeneration(jobId, 'preview_ready', {
-      summary: generated.summary,
-      files,
-      warnings: generated.warnings,
-      provider: generated.provider,
-    });
-  }
   publishGeneration(jobId, 'stage', { id: 'saving', label: 'Saving the project version to Supabase' });
+  stage = 'file_persistence';
   const persistenceInput: Parameters<typeof persistGeneratedVersion>[1] = {
     jobId,
     projectId,
@@ -1257,6 +1272,8 @@ async function generate(jobId: string, projectId: string, userId: string, input:
   if (saveResult.state === 'saved') {
     const version = saveResult.value;
     setGenerationSaveState(jobId, { state: 'saved', versionId: version.id });
+    if (!recoveryAttempt) publishGeneration(jobId, 'preview_ready', { summary: generated.summary, files, warnings: generated.warnings, provider: generated.provider });
+    stage = 'complete';
     await writeAudit(userId, 'generation.completed', jobId);
     publishGeneration(jobId, 'complete', { status: 'complete', versionId: version.id, saved: true });
     return version;
@@ -1264,27 +1281,33 @@ async function generate(jobId: string, projectId: string, userId: string, input:
     const error = saveResult.error;
     if (error instanceof ProjectVersionConflictError || recoveryAttempt) throw error;
     logger.warn({
-      jobId,
+      correlationId: jobId,
+      stage: 'file_persistence',
+      elapsedMs: Date.now() - generationStartedAt,
       category: databaseFailureCategory(error),
       errorName: error instanceof Error ? error.name : 'UnknownError',
-    }, 'generated preview is ready, but Supabase persistence failed; retrying in the background');
+    }, 'generated website could not be saved; the last saved version remains active');
     scheduleVersionPersistenceRetry(jobId, persistenceInput);
     const saveState = generationSaveStates.get(jobId)?.state ?? 'failed';
-    await writeAudit(userId, 'generation.preview_ready', jobId);
     publishGeneration(jobId, 'complete', {
       status: 'complete',
       saved: false,
       saveState,
-      warning: saveState === 'retrying'
-        ? 'The preview is ready. Saving to your account is retrying in the background.'
-        : 'The preview is ready in this browser session, but automatic saving could not be queued.',
+      correlationId: jobId,
+      warning: saveState === 'retrying' ? 'Files generated, but saving failed. The previous saved version remains active while D-GUY retries.' : 'Files generated, but saving failed. Your previous saved version remains active.',
     });
     return undefined;
   }
   } catch (error) {
-    const errorCode = controller.signal.aborted
-      ? 'CANCELLED'
-      : error instanceof GenerationFailure ? storedGenerationFailure(error.message) : 'GENERATION_FAILED';
+    const providerFailures = error instanceof GenerationFailure ? error.failures : error instanceof ProviderFailure ? [error.info] : [];
+    const clientMessage = providerFailures.length
+      ? safeGenerationFailureMessage(providerFailures)
+      : error instanceof RecoveryNeedsApprovalError || error instanceof ProjectVersionConflictError
+        ? error.message
+        : 'AI generation did not complete. Your previous saved version remains active.';
+    const correlatedMessage = `${clientMessage} Reference: ${jobId}`;
+    const errorCode = controller.signal.aborted ? 'CANCELLED' : storedGenerationFailure(correlatedMessage);
+    logger.error({ correlationId: jobId, stage, elapsedMs: Date.now() - generationStartedAt, provider: selectedProvider, model: selectedModel, errorName: error instanceof Error ? error.name : 'UnknownError', providerFailures }, 'generation failed');
     await prisma.generationJob.update({ where: { id: jobId }, data: { status: controller.signal.aborted ? 'cancelled' : 'failed', errorCode, finishedAt: new Date() } });
     await writeAudit(userId, controller.signal.aborted ? 'generation.cancelled' : 'generation.failed', jobId);
     const recoveryError = error instanceof RecoveryNeedsApprovalError;
@@ -1319,8 +1342,7 @@ async function generate(jobId: string, projectId: string, userId: string, input:
         });
       }
     }
-    const errorMessage = recoveryMessage
-      ?? (error instanceof GenerationFailure ? error.message : 'AI generation did not complete. The previous version remains available.');
+    const errorMessage = controller.signal.aborted ? 'Generation was cancelled.' : correlatedMessage;
     publishGeneration(jobId, controller.signal.aborted ? 'cancelled' : 'failed', { status: controller.signal.aborted ? 'cancelled' : 'failed', error: controller.signal.aborted ? 'Generation was cancelled.' : errorMessage });
     throw error;
   } finally { activeControllers.delete(jobId); }
@@ -1330,7 +1352,7 @@ app.get('/api/v1/generations/:jobId', auth, async (req, res) => {
   const job = await prisma.generationJob.findFirst({ where: { id, project: { ownerId: (req as any).user.id } } });
   if (!job) return fail(res, 404, 'NOT_FOUND', 'Generation not found');
   const saveState = generationSaveStates.get(id);
-  const status = saveState && saveState.state !== 'saved' ? 'complete' : job.status;
+  const status = saveState?.state === 'saved' || (job.status === 'complete' && !saveState) ? 'complete' : saveState?.state === 'failed' ? 'failed' : job.status;
   res.json({
     job: {
       id: job.id,

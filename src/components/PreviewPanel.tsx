@@ -79,17 +79,10 @@ export function PreviewPanel({
           : 'Waiting for a project request';
 
   const address = version ? `d-guy://projects/${version.id}/preview` : 'd-guy://preview';
-  const draftFiles = running ? Object.entries(generation.streamedFiles).filter(([, content]) => content.length > 0).map(([path, content]) => ({ path, content })) : [];
   const visibleFiles = [...(version?.files ?? [])];
-  for (const draft of draftFiles) {
-    const existing = visibleFiles.findIndex((file) => file.path === draft.path);
-    if (existing >= 0) visibleFiles.splice(existing, 1, draft);
-    else visibleFiles.push(draft);
-  }
   const selectedFile = visibleFiles.find((file) => file.path === selectedPath)
     ?? visibleFiles.find((file) => file.path === generation.activeFile)
     ?? visibleFiles[0];
-  const selectedIsDraft = !!selectedFile && draftFiles.some((file) => file.path === selectedFile.path);
   const reactPreview = version ? detectWebContainerProject(version.files) !== null : false;
 
   return (
@@ -168,7 +161,6 @@ export function PreviewPanel({
 
         {tab === 'code' && selectedFile && (
           <div className="flex min-h-0 flex-1 flex-col gap-2">
-            {selectedIsDraft && <p role="status" className="shrink-0 rounded-lg bg-cream px-3 py-2 text-xs text-stone">Streaming draft for {selectedFile.path}. It is not saved or executed until validation succeeds.</p>}
             <CodeViewer path={selectedFile.path} content={selectedFile.content} />
           </div>
         )}
@@ -179,7 +171,6 @@ export function PreviewPanel({
               <FileExplorer files={visibleFiles} selectedPath={selectedFile.path} onSelect={onSelectPath} />
             </div>
             <div className="flex min-h-0 flex-col gap-2">
-              {selectedIsDraft && <p role="status" className="shrink-0 rounded-lg bg-cream px-3 py-2 text-xs text-stone">Streaming draft for {selectedFile.path}. It is not saved or executed until validation succeeds.</p>}
               <CodeViewer path={selectedFile.path} content={selectedFile.content} />
             </div>
           </div>

@@ -5,7 +5,7 @@ import type { RuntimeErrorReport } from '@/types/project';
 export interface ApiUser { id: string; email: string; role?: string }
 export interface ApiProject { id: string; name: string; messages: Array<{ id: string; role: 'user' | 'assistant'; text: string }>; versions: ApiVersion[]; activeVersionId: string | null; createdAt: string; updatedAt: string }
 export interface ApiVersion { id: string; number: number; prompt?: string; summary: string; templateId: string; options: Record<string, unknown>; files?: Array<{ path: string; content: string }>; warnings?: string[]; createdAt: string }
-export interface ApiJob { id: string; status: string; progress: number | null; errorCode?: string; saveState?: 'retrying' | 'saved' | 'failed'; versionId?: string }
+export interface ApiJob { id: string; correlationId?: string; status: string; progress: number | null; errorCode?: string; saveState?: 'retrying' | 'saved' | 'failed'; versionId?: string }
 export interface ApiRecoveryAttempt {
   id: string;
   attemptNumber: number;
@@ -45,6 +45,7 @@ export interface ApiRecoveryDashboard {
   sessions: ApiRecoverySession[];
 }
 export interface GenerationStreamEvent { event: string; data: Record<string, unknown> }
+export interface UsageStatus { dailyGenerationLimit: number; generationsLast24Hours: number; nextGenerationAvailableAt: number | null; groqConfigured: boolean; groqProviderState: 'ready' | 'cooldown' | 'unavailable'; groq: null | { model: string; observedAt: number; cooldownUntil?: number; rateLimit: { remainingRequests?: number; limitRequests?: number; resetRequestsMs?: number; remainingTokens?: number; limitTokens?: number; resetTokensMs?: number } } }
 
 export class BackendApiError extends Error {
   constructor(message: string, readonly code?: string, readonly status?: number) {
@@ -83,6 +84,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const backendApi = {
   health: () => request<{ status: string; generationProvider: string }>('/health'),
+  usage: () => request<UsageStatus>('/usage/me'),
   ready: () => request<{ status: 'ready' }>('/ready'),
   me() {
     if (!sessionRestoreInFlight) {
