@@ -5,21 +5,45 @@ import { X509Certificate } from 'node:crypto';
 import { Pool } from 'pg';
 
 const backendRoot = fileURLToPath(new URL('../', import.meta.url));
+const defaultSupabaseCaPath = fileURLToPath(new URL('../certs/prod-ca-2021.crt', import.meta.url));
+
+function loadSupabaseCa(caPath: string | undefined) {
+  const certificatePath = caPath
+    ? (isAbsolute(caPath) ? caPath : resolve(backendRoot, caPath))
+    : defaultSupabaseCaPath;
+  let certificate: string;
+  try {
+    certificate = readFileSync(certificatePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    throw new Error(
+      `Supabase PostgreSQL CA certificate is missing at "${certificatePath}". ` +
+      'Deploy backend/certs/prod-ca-2021.crt with the API or set SUPABASE_DB_CA_CERT_PATH to a valid certificate path relative to the backend directory.',
+      { cause: error },
+    );
+  }
+
+  try {
+    if (!new X509Certificate(certificate).ca) throw new Error('certificate is not a CA');
+  } catch (error) {
+    throw new Error(`Supabase PostgreSQL CA certificate at "${certificatePath}" is invalid or is not a CA certificate.`, { cause: error });
+  }
+
+  return certificate;
+}
 
 export function databaseConnectionDiagnostics(databaseUrl = process.env.DATABASE_URL, caPath = process.env.SUPABASE_DB_CA_CERT_PATH) {
   if (!databaseUrl) return { configured: false, tlsVerification: 'enabled' as const };
   const connection = new URL(databaseUrl);
-  const certPath = caPath ? (isAbsolute(caPath) ? caPath : resolve(backendRoot, caPath)) : undefined;
-  let caFingerprint256: string | undefined;
-  if (certPath) caFingerprint256 = new X509Certificate(readFileSync(certPath)).fingerprint256;
+  const ca = loadSupabaseCa(caPath);
   return {
     configured: true,
     host: connection.hostname,
     port: Number(connection.port || 5432),
     username: decodeURIComponent(connection.username),
     database: decodeURIComponent(connection.pathname.replace(/^\//, '')),
-    caConfigured: Boolean(certPath),
-    caFingerprint256,
+    caConfigured: true,
+    caFingerprint256: new X509Certificate(ca).fingerprint256,
     tlsVerification: 'enabled' as const,
   };
 }
@@ -43,7 +67,7 @@ export function databaseFailureCategory(error: unknown): string {
   return 'database_connection_failed';
 }
 
-/** Build a PostgreSQL pool with TLS verification enabled and an optional Supabase CA bundle. */
+/** Build a PostgreSQL pool with TLS verification enabled and the packaged Supabase CA by default. */
 export function createDatabasePool(databaseUrl = process.env.DATABASE_URL, caPath = process.env.SUPABASE_DB_CA_CERT_PATH) {
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
   const connection = new URL(databaseUrl);
@@ -53,9 +77,8 @@ export function createDatabasePool(databaseUrl = process.env.DATABASE_URL, caPat
   connection.searchParams.delete('sslrootcert');
   connection.searchParams.delete('uselibpqcompat');
 
-  const ssl = caPath
-    ? { ca: readFileSync(isAbsolute(caPath) ? caPath : resolve(backendRoot, caPath), 'utf8'), rejectUnauthorized: true as const }
-    : { rejectUnauthorized: true as const };
+  const ca = loadSupabaseCa(caPath);
+  const ssl = { ca, rejectUnauthorized: true as const };
 
   return new Pool({ connectionString: connection.toString(), ssl, max: 10, connectionTimeoutMillis: 8_000, idleTimeoutMillis: 30_000 });
 }

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "src/server.ts": {
+      "includeFiles": "certs/prod-ca-2021.crt"
+    },
+    "dist/server.js": {
+      "includeFiles": "certs/prod-ca-2021.crt"
+    }
+  }
+}
