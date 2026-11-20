@@ -40,9 +40,13 @@ import { GitHubIntegrationError, publishProjectPullRequest } from './integration
 import { createDeploymentPackage, DeploymentPreparationError } from './integrations/deployment.js';
 
 // Vercel's TypeScript checker resolves Helmet's CommonJS declaration as a module namespace.
-// Load its actual CommonJS middleware factory and constrain it to Express's handler contract.
+// Load the package's actual CommonJS export; validate it before adapting its type for Express.
 const nodeRequire = createRequire(import.meta.url);
-const helmetFactory = nodeRequire('helmet') as () => RequestHandler;
+const helmetExport: unknown = nodeRequire('helmet');
+if (typeof helmetExport !== 'function') throw new TypeError('Helmet did not export a middleware factory.');
+const helmetFactory = helmetExport as () => unknown;
+const helmetMiddleware = helmetFactory();
+if (typeof helmetMiddleware !== 'function') throw new TypeError('Helmet did not return an Express middleware.');
 
 const logger = pino({ redact: ['req.headers.authorization', 'req.headers.cookie', 'req.body.password', 'req.body.accessToken', 'req.body.refreshToken', 'req.body.prompt'] });
 const databaseUrl = process.env.DATABASE_URL;
@@ -159,7 +163,7 @@ app.use((req, res, next) => {
   res.on('finish', () => logger.info({ requestId, method: req.method, path: req.path, status: res.statusCode, durationMs: Date.now() - started }));
   next();
 });
-app.use(helmetFactory());
+app.use(helmetMiddleware as RequestHandler);
 const origins = [...new Set((process.env.FRONTEND_ORIGIN || 'http://localhost:5173').split(',').map((s) => s.trim()))];
 for (const origin of origins) {
   const parsed = new URL(origin);
