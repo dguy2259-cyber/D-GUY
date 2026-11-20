@@ -1,14 +1,6 @@
 
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "backend/src/server.ts": {
-      "includeFiles": "backend/certs/prod-ca-2021.crt"
-    },
-    "backend/dist/server.js": {
-      "includeFiles": "backend/certs/prod-ca-2021.crt"
-    }
-  },
   "rewrites": [
     {
       "source": "/api/:path*",
