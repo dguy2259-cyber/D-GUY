@@ -2,10 +2,11 @@
  Express request augmentation is kept local to this service; refine to typed request state as route modules split out. */
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars */
 import { config as loadEnv } from 'dotenv';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 loadEnv({ path: fileURLToPath(new URL('../.env', import.meta.url)) });
 import express from 'express';
-import * as helmetModule from 'helmet';
+import type { RequestHandler } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import pino from 'pino';
@@ -37,6 +38,11 @@ import { sessionCookieOptions } from './auth/cookies.js';
 import { establishAdministratorSession } from './auth/adminLoginPolicy.js';
 import { GitHubIntegrationError, publishProjectPullRequest } from './integrations/github.js';
 import { createDeploymentPackage, DeploymentPreparationError } from './integrations/deployment.js';
+
+// Vercel's TypeScript checker resolves Helmet's CommonJS declaration as a module namespace.
+// Load its actual CommonJS middleware factory and constrain it to Express's handler contract.
+const nodeRequire = createRequire(import.meta.url);
+const helmetFactory = nodeRequire('helmet') as () => RequestHandler;
 
 const logger = pino({ redact: ['req.headers.authorization', 'req.headers.cookie', 'req.body.password', 'req.body.accessToken', 'req.body.refreshToken', 'req.body.prompt'] });
 const databaseUrl = process.env.DATABASE_URL;
@@ -153,7 +159,7 @@ app.use((req, res, next) => {
   res.on('finish', () => logger.info({ requestId, method: req.method, path: req.path, status: res.statusCode, durationMs: Date.now() - started }));
   next();
 });
-app.use(helmetModule.default());
+app.use(helmetFactory());
 const origins = [...new Set((process.env.FRONTEND_ORIGIN || 'http://localhost:5173').split(',').map((s) => s.trim()))];
 for (const origin of origins) {
   const parsed = new URL(origin);
